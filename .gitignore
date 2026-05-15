@@ -1,0 +1,8 @@
+zig-out/
+.zig-cache/
+data/
+test-chapters/
+downloads/
+.venv/
+*.pyc
+__pycache__
