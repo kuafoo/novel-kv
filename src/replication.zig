@@ -6,6 +6,8 @@ const storage = @import("storage.zig");
 const resp = @import("resp.zig");
 const command = @import("command.zig");
 const log = @import("log.zig");
+const tls = @import("tls");
+const tls_adapter = @import("tls_adapter.zig");
 
 pub const ReplicaState = enum {
     disconnected,
@@ -422,25 +424,80 @@ pub fn runReplicator(
             continue;
         };
 
-        var stream_reader = std.Io.net.Stream.reader(stream, io, &read_buf);
-        var stream_writer = std.Io.net.Stream.writer(stream, io, &write_buf);
-        const reader = &stream_reader.interface;
-        const writer = &stream_writer.interface;
+        // TLS 模式：包装连接
+        const use_tls = db.tls_config != null and db.tls_config.?.replica_tls;
 
-        log.info("Connected to master {s}:{d}", .{ config.master_host, config.master_port });
+        if (use_tls) {
+            var rng_impl: std.Random.IoSource = .{ .io = io };
 
-        // 握手：PING → AUTH → REPLCONF → PSYNC
-        if (doHandshake(reader, writer, config)) {
-            // 全量同步 + 流式接收
-            if (doFullSyncAndStream(db, allocator, reader, config, shutdown_flag)) {
-                // 正常退出（shutdown）
+            // Determine TLS verification strategy before connecting
+            var tls_conn = blk: {
+                // If CA file specified, use it for verification
+                if (db.tls_config) |tc| {
+                    if (tc.ca_file) |ca_path| {
+                        const ca = tls.config.cert.fromFilePathAbsolute(allocator, io, ca_path) catch {
+                            log.warn("Failed to load CA certificate: {s}", .{ca_path});
+                            break :blk null;
+                        };
+                        break :blk tls.clientFromStream(io, stream, .{
+                            .host = config.master_host,
+                            .root_ca = ca,
+                            .rng = rng_impl.interface(),
+                            .now = std.Io.Clock.real.now(io),
+                        }) catch null;
+                    }
+                }
+                // No CA file: skip verification (self-signed certs)
+                break :blk tls.clientFromStream(io, stream, .{
+                    .host = config.master_host,
+                    .root_ca = .empty,
+                    .insecure_skip_verify = true,
+                    .rng = rng_impl.interface(),
+                    .now = std.Io.Clock.real.now(io),
+                }) catch null;
+            };
+
+            if (tls_conn) |*conn| {
+                var tls_stream = tls_adapter.TlsStream.wrap(conn, stream);
+
+                log.info("Connected to master {s}:{d} (TLS)", .{ config.master_host, config.master_port });
+
+                const reader = tls_stream.reader();
+                const writer = tls_stream.writer();
+
+                if (doHandshake(reader, writer, config)) {
+                    if (doFullSyncAndStream(db, allocator, reader, config, shutdown_flag)) {
+                        tls_stream.close(io);
+                        return;
+                    }
+                }
+
+                tls_stream.close(io);
+            } else {
+                log.warn("TLS connection to master failed, retrying in 5s...", .{});
                 stream.close(io);
-                return;
+                std.Io.sleep(io, .fromSeconds(5), .awake) catch {};
+                continue;
             }
+        } else {
+            var stream_reader = std.Io.net.Stream.reader(stream, io, &read_buf);
+            var stream_writer = std.Io.net.Stream.writer(stream, io, &write_buf);
+            const reader = &stream_reader.interface;
+            const writer = &stream_writer.interface;
+
+            log.info("Connected to master {s}:{d}", .{ config.master_host, config.master_port });
+
+            if (doHandshake(reader, writer, config)) {
+                if (doFullSyncAndStream(db, allocator, reader, config, shutdown_flag)) {
+                    stream.close(io);
+                    return;
+                }
+            }
+
+            stream.close(io);
         }
 
         // 连接断开，清理并重连
-        stream.close(io);
         log.warn("Lost connection to master, reconnecting in 5s...", .{});
         db.is_replica_connected.store(false, .release);
         std.Io.sleep(io, .fromSeconds(5), .awake) catch {};

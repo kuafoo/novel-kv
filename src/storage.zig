@@ -5,6 +5,7 @@ const std = @import("std");
 const rocksdb = @import("rocksdb");
 const log = @import("log.zig");
 const replication = @import("replication.zig");
+const tls = @import("tls");
 
 /// 最大数据库数量，对应 RocksDB Column Family 数量（db0..db15）
 pub const MAX_DATABASES: usize = 16;
@@ -29,6 +30,16 @@ pub const Config = struct {
     cache_size: usize = 256 * 1024 * 1024,
     /// Bloom Filter 每个_key 的位数，默认 10（约 1% 误判率）
     bloom_bits_per_key: f64 = 10.0,
+    /// TLS 配置（非 null 表示启用 TLS）
+    tls_config: ?TlsConfig = null,
+};
+
+pub const TlsConfig = struct {
+    cert_file: []const u8,
+    key_file: []const u8,
+    ca_file: ?[]const u8 = null,
+    /// 副本连接主节点时是否使用 TLS
+    replica_tls: bool = false,
 };
 
 pub const Database = struct {
@@ -50,6 +61,10 @@ pub const Database = struct {
     is_replica_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 副本配置（仅副本模式有值）
     repl_config: ?replication.ReplicaConfig = null,
+    /// TLS 证书密钥对（启动时加载，所有 TLS 连接共享）
+    tls_auth: ?tls.config.CertKeyPair = null,
+    /// TLS 配置
+    tls_config: ?TlsConfig = null,
 
     /// 打开或创建数据库。首次启动时自动创建 16 个 Column Family。
     /// 配置 Bloom Filter、Block Cache、Compaction 调优、Statistics 等引擎参数。
@@ -356,11 +371,12 @@ pub const Database = struct {
         const cf = self.cf_handles[db_index];
         const n = keys.len;
 
-        // 准备 C 数组
         const key_ptrs = self.allocator.alloc([*c]const u8, n) catch return error.ReadFailed;
         defer self.allocator.free(key_ptrs);
         const key_lens = self.allocator.alloc(usize, n) catch return error.ReadFailed;
         defer self.allocator.free(key_lens);
+        const cf_arr = self.allocator.alloc(?*const rocksdb.rocksdb_column_family_handle_t, n) catch return error.ReadFailed;
+        defer self.allocator.free(cf_arr);
         const val_ptrs = self.allocator.alloc([*c]u8, n) catch return error.ReadFailed;
         const val_lens = self.allocator.alloc(usize, n) catch return error.ReadFailed;
         const errs = self.allocator.alloc([*c]u8, n) catch return error.ReadFailed;
@@ -368,6 +384,7 @@ pub const Database = struct {
         for (keys, 0..) |k, i| {
             key_ptrs[i] = k.ptr;
             key_lens[i] = k.len;
+            cf_arr[i] = cf;
             val_ptrs[i] = null;
             val_lens[i] = 0;
             errs[i] = null;
@@ -376,7 +393,7 @@ pub const Database = struct {
         rocksdb.rocksdb_multi_get_cf(
             self.db,
             self.read_options,
-            &cf,
+            cf_arr.ptr,
             n,
             key_ptrs.ptr,
             key_lens.ptr,
@@ -398,9 +415,6 @@ pub const Database = struct {
         }
         self.allocator.free(val_lens);
         self.allocator.free(errs);
-        // val_ptrs 中的非 null 指针需要调用方通过 freeValue 释放
-        // 将 val_ptrs 临时保存到 results 的内存由 RocksDB 分配，调用方释放
-        // 但 val_ptrs 本身的分配需要释放
         self.allocator.free(val_ptrs);
 
         return results;

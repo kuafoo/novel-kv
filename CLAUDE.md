@@ -15,6 +15,7 @@
 - `src/resp.zig` — RESP 协议写入
 - `src/log.zig` — 分级日志（debug/info/warn/error）
 - `src/replication.zig` — 主从复制（应用层命令复制，Oplog 广播）
+- `src/tls_adapter.zig` — TLS 适配器，桥接 tls.Connection 到 std.Io.Reader/Writer
 - `crawl_novels.py` — 小说爬虫，为压缩基准测试提供真实文本数据
 - `src/compress_bench.zig` — 压缩基准测试工具
 
@@ -27,6 +28,7 @@
 - RocksDB Checkpoint 实现秒级热备份（硬链接 SST 文件）
 - AUTH 密码认证（`--requirepass`）
 - 主从复制：`--replicaof <host> <port>` 启动副本模式，最终一致性
+- TLS 加密：`--tls-cert/--tls-key` 启用 TLS 1.3，`--tls-replica` 副本 TLS 连接
 - 危险命令（flushdb/flushall）可禁用
 
 ## Supported Commands
@@ -51,7 +53,8 @@ zig build test               # Unit tests
 
 ## Dependencies
 
-- Zig 0.17.0-dev
+- Zig 0.16.0
 - RocksDB (static lib in deps/lib/)
 - Zstd, Snappy (static libs in deps/lib/)
+- ianic/tls.zig (local dep in deps/tls.zig/)
 - libc, libstdc++, libpthread, libdl, librt

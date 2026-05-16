@@ -6,3 +6,7 @@ downloads/
 .venv/
 *.pyc
 __pycache__
+certs/
+backups/
+package.json
+package-lock.json

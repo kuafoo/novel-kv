@@ -6,6 +6,8 @@ const resp = @import("resp.zig");
 const command = @import("command.zig");
 const replication = @import("replication.zig");
 const log = @import("log.zig");
+const tls = @import("tls");
+const tls_adapter = @import("tls_adapter.zig");
 
 /// 启动 TCP 服务，接受客户端连接并为每个连接启动并发处理协程。
 /// shutdown_flag 为 true 时停止接受新连接并退出。
@@ -44,17 +46,37 @@ pub fn serve(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, ho
     log.info("Server stopped accepting connections", .{});
 }
 
-/// 处理单个客户端连接：循环读取 RESP 命令，执行后写回响应。
-/// 每个连接拥有独立的 ClientState（数据库选择、认证状态等）。
+/// 处理单个客户端连接：根据是否启用 TLS 选择加密或明文通道，
+/// 然后循环读取 RESP 命令，执行后写回响应。
 fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, stream: std.Io.net.Stream, port: u16) std.Io.Cancelable!void {
-    var read_buf: [65536]u8 = undefined;
-    var stream_reader = std.Io.net.Stream.reader(stream, io, &read_buf);
-    var write_buf: [65536]u8 = undefined;
-    var stream_writer = std.Io.net.Stream.writer(stream, io, &write_buf);
+    if (db.tls_auth) |*auth| {
+        // TLS 模式：serverFromStream 在栈上创建 Connection（含内部 TCP 缓冲区）
+        var rng_impl: std.Random.IoSource = .{ .io = io };
+        var tls_conn = tls.serverFromStream(io, stream, .{
+            .auth = auth,
+            .rng = rng_impl.interface(),
+            .now = std.Io.Clock.real.now(io),
+        }) catch {
+            log.warn("TLS handshake failed", .{});
+            stream.close(io);
+            return;
+        };
 
-    const reader = &stream_reader.interface;
-    const writer = &stream_writer.interface;
+        // TlsStream 持有 Connection 指针，桥接为 Reader/Writer 接口
+        var tls_stream = tls_adapter.TlsStream.wrap(&tls_conn, stream);
+        handleConnectionInner(io, allocator, db, tls_stream.reader(), tls_stream.writer(), stream, port) catch {};
+        tls_stream.close(io);
+    } else {
+        var read_buf: [65536]u8 = undefined;
+        var stream_reader = std.Io.net.Stream.reader(stream, io, &read_buf);
+        var write_buf: [65536]u8 = undefined;
+        var stream_writer = std.Io.net.Stream.writer(stream, io, &write_buf);
+        handleConnectionInner(io, allocator, db, &stream_reader.interface, &stream_writer.interface, stream, port) catch {};
+        stream.close(io);
+    }
+}
 
+fn handleConnectionInner(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, reader: *std.Io.Reader, writer: *std.Io.Writer, stream: std.Io.net.Stream, port: u16) std.Io.Cancelable!void {
     var client = command.ClientState{ .io = io, .port = port };
 
     while (true) {
@@ -90,7 +112,6 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Datab
 
         if (client.should_quit) break;
     }
-    stream.close(io);
 }
 
 /// 从 RESP 流中读取一条完整命令，支持 Array（*N\r\n$len\r\ndata\r\n）和 Inline 两种格式。

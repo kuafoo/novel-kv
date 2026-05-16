@@ -582,6 +582,7 @@ fn cmdCommand(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.
 fn cmdInfo(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
     const pid = std.posix.system.getpid();
     const role = if (db.is_replica) "replica" else "master";
+    const tls_status = if (db.tls_config != null) "yes" else "no";
 
     // 复制信息
     var repl_info: []const u8 = "";
@@ -608,7 +609,7 @@ fn cmdInfo(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
     if (args.len > 1) {
         const section = getStringArg(args, 1) orelse "";
         if (std.mem.eql(u8, section, "server")) {
-            const info = std.fmt.allocPrint(allocator, "# Server\r\nnovelkv_version:1.0.0\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\n{s}", .{ client.port, pid, repl_info }) catch return CommandResult{ .error_msg = "ERR out of memory" };
+            const info = std.fmt.allocPrint(allocator, "# Server\r\nnovelkv_version:1.0.0\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\ntls_enabled:{s}\r\n{s}", .{ client.port, pid, tls_status, repl_info }) catch return CommandResult{ .error_msg = "ERR out of memory" };
             return CommandResult{ .owned_string = info };
         }
         if (std.mem.eql(u8, section, "stats")) {
@@ -630,8 +631,8 @@ fn cmdInfo(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
     const cf_stats = db.getCFStats(client.db_index);
     const key_count = db.estimateKeyCount(client.db_index);
     const info = std.fmt.allocPrint(allocator,
-        "# NovelKV\r\nnovelkv_version:1.0.0\r\nengine:rocksdb+Zstd+bloom\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\n\r\n# Stats(db{d})\r\nkeys:{d}\r\nsst_files:{d}\r\nsst_size_bytes:{d}\r\nblock_cache_usage:{d}\r\nblock_cache_capacity:{d}\r\n{s}",
-        .{ client.port, pid, client.db_index, key_count, cf_stats.live_sst_files, cf_stats.live_sst_size, cache.usage, cache.capacity, repl_info },
+        "# NovelKV\r\nnovelkv_version:1.0.0\r\nengine:rocksdb+Zstd+bloom\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\ntls_enabled:{s}\r\n\r\n# Stats(db{d})\r\nkeys:{d}\r\nsst_files:{d}\r\nsst_size_bytes:{d}\r\nblock_cache_usage:{d}\r\nblock_cache_capacity:{d}\r\n{s}",
+        .{ client.port, pid, tls_status, client.db_index, key_count, cf_stats.live_sst_files, cf_stats.live_sst_size, cache.usage, cache.capacity, repl_info },
     ) catch return CommandResult{ .error_msg = "ERR out of memory" };
     return CommandResult{ .owned_string = info };
 }

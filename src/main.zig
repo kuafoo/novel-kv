@@ -7,6 +7,7 @@ const command = @import("command.zig");
 const storage = @import("storage.zig");
 const replication = @import("replication.zig");
 const log = @import("log.zig");
+const tls = @import("tls");
 
 // --disable-dangerous 一键禁用的命令列表
 const dangerous_commands = [_][]const u8{ "flushdb", "flushall" };
@@ -35,6 +36,10 @@ pub fn main(init: std.process.Init) !void {
     var replicaof_host: ?[]const u8 = null;
     var replicaof_port: ?u16 = null;
     var masterauth: ?[]const u8 = null;
+    var tls_cert: ?[]const u8 = null;
+    var tls_key: ?[]const u8 = null;
+    var tls_ca: ?[]const u8 = null;
+    var tls_replica = false;
     defer {
         for (disabled_commands_list.items) |cmd| allocator.free(cmd);
         disabled_commands_list.deinit(allocator);
@@ -100,6 +105,20 @@ pub fn main(init: std.process.Init) !void {
             if (args.next()) |val| {
                 masterauth = val;
             }
+        } else if (std.mem.eql(u8, arg, "--tls-cert")) {
+            if (args.next()) |val| {
+                tls_cert = val;
+            }
+        } else if (std.mem.eql(u8, arg, "--tls-key")) {
+            if (args.next()) |val| {
+                tls_key = val;
+            }
+        } else if (std.mem.eql(u8, arg, "--tls-ca")) {
+            if (args.next()) |val| {
+                tls_ca = val;
+            }
+        } else if (std.mem.eql(u8, arg, "--tls-replica")) {
+            tls_replica = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return;
@@ -137,15 +156,47 @@ pub fn main(init: std.process.Init) !void {
     log.info("Data directory: {s}", .{data_path});
     if (requirepass) |_| log.info("Authentication required", .{});
 
+    // TLS 初始化
+    var tls_auth: ?tls.config.CertKeyPair = null;
+    defer {
+        if (tls_auth) |*a| a.deinit(allocator);
+    }
+
+    var tls_cfg: ?storage.TlsConfig = null;
+
+    if (tls_cert != null and tls_key != null) {
+        tls_auth = tls.config.CertKeyPair.fromFilePathAbsolute(allocator, io, tls_cert.?, tls_key.?) catch |err| {
+            log.err("Failed to load TLS certificate: {}", .{err});
+            return err;
+        };
+        log.info("TLS enabled: cert={s}", .{tls_cert.?});
+        tls_cfg = .{
+            .cert_file = tls_cert.?,
+            .key_file = tls_key.?,
+            .ca_file = tls_ca,
+            .replica_tls = tls_replica,
+        };
+    } else if (tls_cert != null or tls_key != null) {
+        log.err("Both --tls-cert and --tls-key are required for TLS", .{});
+        return error.InvalidArgument;
+    }
+
     var db = storage.Database.open(allocator, .{
         .path = data_path,
         .disabled_commands = disabled_commands_list.items,
         .password = requirepass,
+        .tls_config = tls_cfg,
     }) catch |e| {
         log.err("Failed to open database: {}", .{e});
         return e;
     };
     defer db.close();
+
+    // 数据库打开后设置 TLS 状态
+    if (tls_auth) |auth| {
+        db.tls_auth = auth;
+        db.tls_config = tls_cfg;
+    }
 
     // 复制模式初始化
     if (replicaof_host) |master_host| {
@@ -203,13 +254,17 @@ fn printUsage() void {
         \\  -a, --requirepass <PASS>   Require client authentication
         \\  --replicaof <HOST> <PORT>  Replicate from master (replica mode)
         \\  --masterauth <PASS>        Master authentication password
+        \\  --tls-cert <PATH>          TLS certificate file (enables TLS)
+        \\  --tls-key <PATH>           TLS private key file (required with --tls-cert)
+        \\  --tls-ca <PATH>            CA certificate for client/replica verification
+        \\  --tls-replica              Use TLS for replica-to-master connection
         \\  --help                     Show this help
         \\
         \\Examples:
         \\  novelkv
         \\  novelkv --requirepass mysecret
-        \\  novelkv --requirepass mysecret --disable-dangerous
-        \\  novelkv --port 16380 --replicaof 127.0.0.1 16379
+        \\  novelkv --tls-cert cert.pem --tls-key key.pem
+        \\  novelkv --port 16380 --replicaof 127.0.0.1 16379 --tls-replica
         \\
         \\Compatible with Redis protocol (RESP). Use redis-cli or any Redis client to connect.
         \\
