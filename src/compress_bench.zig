@@ -73,16 +73,35 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Raw data size: {d} bytes ({d:.1} MB)\n", .{ raw_bytes, @as(f64, @floatFromInt(raw_bytes)) / 1024.0 / 1024.0 });
 
     const configs = [_]CompressionConfig{
+        // Baseline: no compression
         .{ .name = "no_compression", .compression_type = 0 },
-        .{ .name = "zstd_default", .compression_type = 7 },
-        .{ .name = "zstd_l9", .compression_type = 7, .level = 9 },
-        .{ .name = "zstd_l19", .compression_type = 7, .level = 19 },
-        // Balanced: dict512K + level9 + 128KB block
+        // Levels 1,3,5,7,9,12,15,19 without dict, default 4KB block
+        .{ .name = "zstd_l1_4kb", .compression_type = 7, .level = 1, .block_size = 4096 },
+        .{ .name = "zstd_l3_4kb", .compression_type = 7, .level = 3, .block_size = 4096 },
+        .{ .name = "zstd_l5_4kb", .compression_type = 7, .level = 5, .block_size = 4096 },
+        .{ .name = "zstd_l7_4kb", .compression_type = 7, .level = 7, .block_size = 4096 },
+        .{ .name = "zstd_l9_4kb", .compression_type = 7, .level = 9, .block_size = 4096 },
+        .{ .name = "zstd_l12_4kb", .compression_type = 7, .level = 12, .block_size = 4096 },
+        .{ .name = "zstd_l15_4kb", .compression_type = 7, .level = 15, .block_size = 4096 },
+        .{ .name = "zstd_l19_4kb", .compression_type = 7, .level = 19, .block_size = 4096 },
+        // Block size sweep: level 9, no dict, 4K/16K/32K/64K/128K/256K
+        .{ .name = "zstd_l9_16kb", .compression_type = 7, .level = 9, .block_size = 16 * 1024 },
+        .{ .name = "zstd_l9_32kb", .compression_type = 7, .level = 9, .block_size = 32 * 1024 },
+        .{ .name = "zstd_l9_64kb", .compression_type = 7, .level = 9, .block_size = 64 * 1024 },
+        .{ .name = "zstd_l9_128kb", .compression_type = 7, .level = 9, .block_size = 128 * 1024 },
+        .{ .name = "zstd_l9_256kb", .compression_type = 7, .level = 9, .block_size = 256 * 1024 },
+        // Dict size sweep: level 9, 128KB block, dict 32K/64K/128K/256K/512K/1M
+        .{ .name = "dict32k_l9_128kb", .compression_type = 7, .level = 9, .max_dict_bytes = 32 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 128 * 1024 },
+        .{ .name = "dict64k_l9_128kb", .compression_type = 7, .level = 9, .max_dict_bytes = 64 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 128 * 1024 },
+        .{ .name = "dict128k_l9_128kb", .compression_type = 7, .level = 9, .max_dict_bytes = 128 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 128 * 1024 },
+        .{ .name = "dict256k_l9_128kb", .compression_type = 7, .level = 9, .max_dict_bytes = 256 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 128 * 1024 },
         .{ .name = "dict512k_l9_128kb", .compression_type = 7, .level = 9, .max_dict_bytes = 512 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 128 * 1024 },
-        // Balanced: dict512K + level9 + 64KB block
-        .{ .name = "dict512k_l9_64kb", .compression_type = 7, .level = 9, .max_dict_bytes = 512 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 65536 },
-        // Max ratio: dict1M + level19 + 128KB block
-        .{ .name = "dict1m_l19_128kb", .compression_type = 7, .level = 19, .max_dict_bytes = 1024 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 128 * 1024 },
+        .{ .name = "dict1m_l9_128kb", .compression_type = 7, .level = 9, .max_dict_bytes = 1024 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 128 * 1024 },
+        // Best ratio candidates: high level + large dict + large block
+        .{ .name = "dict512k_l15_128kb", .compression_type = 7, .level = 15, .max_dict_bytes = 512 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 128 * 1024 },
+        .{ .name = "dict512k_l19_128kb", .compression_type = 7, .level = 19, .max_dict_bytes = 512 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 128 * 1024 },
+        .{ .name = "dict1m_l15_256kb", .compression_type = 7, .level = 15, .max_dict_bytes = 1024 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 256 * 1024 },
+        .{ .name = "dict1m_l19_256kb", .compression_type = 7, .level = 19, .max_dict_bytes = 1024 * 1024, .zstd_max_train_bytes = 10_000_000, .use_zstd_dict_trainer = true, .block_size = 256 * 1024 },
     };
 
     var results: std.ArrayList(BenchmarkResult) = .empty;
@@ -91,8 +110,8 @@ pub fn main(init: std.process.Init) !void {
     for (&configs) |config| {
         std.debug.print("\n=== Testing: {s} ===\n", .{config.name});
 
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const db_path = try std.fmt.bufPrintZ(&path_buf, "/tmp/novelkv_bench_{s}", .{config.name});
+        const db_path = try std.fmt.allocPrintSentinel(allocator, "/tmp/novelkv_bench_{s}", .{config.name}, 0);
+        defer allocator.free(db_path);
 
         std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
 

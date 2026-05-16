@@ -15,7 +15,7 @@ import threading
 
 BASE_URL = "https://www.00shu.la"
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-chapters")
-TARGET_BYTES = 600 * 1024 * 1024  # 600MB target
+TARGET_BYTES = 500 * 1024 * 1024  # 500MB target
 DELAY = 0.15  # seconds between requests per thread
 MAX_RETRIES = 3
 NUM_WORKERS = 16  # concurrent download threads

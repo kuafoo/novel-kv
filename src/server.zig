@@ -1,41 +1,66 @@
+// NovelKV - 专用小说章节文本 KV 存储系统
+// TCP 服务模块：监听连接、RESP 协议解析、命令分发与响应序列化
 const std = @import("std");
 const storage = @import("storage.zig");
 const resp = @import("resp.zig");
 const command = @import("command.zig");
+const replication = @import("replication.zig");
+const log = @import("log.zig");
 
-pub fn serve(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, host: []const u8, port: u16) !void {
+/// 启动 TCP 服务，接受客户端连接并为每个连接启动并发处理协程。
+/// shutdown_flag 为 true 时停止接受新连接并退出。
+/// 副本模式下同时启动 Replicator 协程连接主节点。
+pub fn serve(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, host: []const u8, port: u16, shutdown_flag: *std.atomic.Value(bool)) !void {
     const address = try std.Io.net.IpAddress.parse(host, port);
     var tcp_server = try address.listen(io, .{ .reuse_address = true });
     defer tcp_server.deinit(io);
 
-    std.debug.print("NovelKV listening on {s}:{d}\n", .{ host, port });
+    log.info("Listening on {s}:{d}", .{ host, port });
 
     var group: std.Io.Group = .init;
 
-    while (true) {
+    // 副本模式：启动 Replicator 协程
+    if (db.is_replica) {
+        if (db.repl_config) |config| {
+            group.concurrent(io, replication.runReplicator, .{
+                io, allocator, db, config, shutdown_flag,
+            }) catch {
+                log.err("Failed to start replicator", .{});
+            };
+        }
+    }
+
+    while (!shutdown_flag.load(.acquire)) {
         const stream = tcp_server.accept(io) catch |err| {
-            std.debug.print("accept error: {}\n", .{err});
+            if (shutdown_flag.load(.acquire)) break;
+            log.warn("Accept error: {}", .{err});
             continue;
         };
-        group.concurrent(io, handleConnection, .{ io, allocator, db, stream }) catch {
+        group.concurrent(io, handleConnection, .{ io, allocator, db, stream, port }) catch {
             stream.close(io);
             continue;
         };
     }
+    log.info("Server stopped accepting connections", .{});
 }
 
-fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, stream: std.Io.net.Stream) std.Io.Cancelable!void {
-    var read_buf: [8192]u8 = undefined;
+/// 处理单个客户端连接：循环读取 RESP 命令，执行后写回响应。
+/// 每个连接拥有独立的 ClientState（数据库选择、认证状态等）。
+fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, stream: std.Io.net.Stream, port: u16) std.Io.Cancelable!void {
+    var read_buf: [65536]u8 = undefined;
     var stream_reader = std.Io.net.Stream.reader(stream, io, &read_buf);
-    var write_buf: [8192]u8 = undefined;
+    var write_buf: [65536]u8 = undefined;
     var stream_writer = std.Io.net.Stream.writer(stream, io, &write_buf);
 
     const reader = &stream_reader.interface;
     const writer = &stream_writer.interface;
 
+    var client = command.ClientState{ .io = io, .port = port };
+
     while (true) {
         const args = readRespCommand(reader, allocator) catch |err| {
             if (err == error.EndOfStream) break;
+            drainLine(reader) catch break;
             resp.writeError(writer, "ERR protocol error") catch {};
             writer.flush() catch {};
             continue;
@@ -45,20 +70,31 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Datab
             allocator.free(args);
         }
 
+        // 将原始字节参数包装为 RespValue 以传入命令处理层
         const resp_args = allocator.alloc(resp.RespValue, args.len) catch continue;
         defer allocator.free(resp_args);
         for (args, resp_args) |a, *r| {
             r.* = .{ .bulk_string = a };
         }
 
-        const result = command.execute(db, allocator, resp_args);
+        const result = command.execute(db, allocator, resp_args, &client);
         writeResult(writer, allocator, result) catch {};
         freeResult(allocator, result);
         writer.flush() catch {};
+
+        // 副本 PSYNC 后：进入全量同步 + 流式广播
+        if (client.needs_fullsync) {
+            replication.handleReplicaStream(io, db, reader, writer, stream, &client);
+            break;
+        }
+
+        if (client.should_quit) break;
     }
     stream.close(io);
 }
 
+/// 从 RESP 流中读取一条完整命令，支持 Array（*N\r\n$len\r\ndata\r\n）和 Inline 两种格式。
+/// 返回的每个参数都是独立分配的堆内存，由调用方释放。
 fn readRespCommand(reader: *std.Io.Reader, allocator: std.mem.Allocator) ![]const []const u8 {
     const first_line = try reader.takeDelimiterInclusive('\n');
     const line = stripCR(first_line);
@@ -66,7 +102,9 @@ fn readRespCommand(reader: *std.Io.Reader, allocator: std.mem.Allocator) ![]cons
     if (line.len == 0) return error.InvalidProtocol;
 
     if (line[0] == '*') {
+        // RESP Array 格式：*<count>\r\n$<len>\r\n<data>\r\n ...
         const count = std.fmt.parseInt(usize, line[1..], 10) catch return error.InvalidProtocol;
+        if (count > 1_000_000) return error.InvalidProtocol;
         var args = try allocator.alloc([]const u8, count);
         var filled: usize = 0;
         errdefer {
@@ -80,6 +118,7 @@ fn readRespCommand(reader: *std.Io.Reader, allocator: std.mem.Allocator) ![]cons
 
             if (h.len == 0 or h[0] != '$') return error.InvalidProtocol;
             const len = std.fmt.parseInt(usize, h[1..], 10) catch return error.InvalidProtocol;
+            if (len > 512 * 1024 * 1024) return error.InvalidProtocol;
 
             if (len == 0) {
                 args[i] = try allocator.dupe(u8, "");
@@ -93,6 +132,7 @@ fn readRespCommand(reader: *std.Io.Reader, allocator: std.mem.Allocator) ![]cons
         }
         return args;
     } else {
+        // Inline 命令格式：以空格分隔的纯文本命令（兼容 redis-cli 单行输入）
         var parts: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (parts.items) |a| allocator.free(a);
@@ -109,6 +149,7 @@ fn readRespCommand(reader: *std.Io.Reader, allocator: std.mem.Allocator) ![]cons
     }
 }
 
+/// 去除行尾的 \r\n 分隔符
 fn stripCR(data: []u8) []u8 {
     var s = data;
     if (s.len > 0 and s[s.len - 1] == '\n') s = s[0 .. s.len - 1];
@@ -116,6 +157,12 @@ fn stripCR(data: []u8) []u8 {
     return s;
 }
 
+/// 跳过当前行剩余内容（协议错误恢复用）
+fn drainLine(reader: *std.Io.Reader) !void {
+    _ = reader.takeDelimiterInclusive('\n') catch return error.EndOfStream;
+}
+
+/// 将命令执行结果序列化为 RESP 协议格式写入客户端
 fn writeResult(writer: *std.Io.Writer, allocator: std.mem.Allocator, result: command.CommandResult) !void {
     switch (result) {
         .ok => {
@@ -127,15 +174,12 @@ fn writeResult(writer: *std.Io.Writer, allocator: std.mem.Allocator, result: com
         .error_msg => |s| {
             try resp.writeError(writer, s);
         },
-        .bulk_string => |maybe_val| {
+        .owned_string => |maybe_val| {
             if (maybe_val) |val| {
                 try resp.writeBulkString(writer, val);
             } else {
                 try writer.writeAll("$-1\r\n");
             }
-        },
-        .owned_string => |val| {
-            try resp.writeBulkString(writer, val);
         },
         .integer => |n| {
             try resp.writeInteger(writer, n);
@@ -159,11 +203,14 @@ fn writeResult(writer: *std.Io.Writer, allocator: std.mem.Allocator, result: com
     }
 }
 
+/// 释放 CommandResult 中所有堆分配的内存
 fn freeResult(allocator: std.mem.Allocator, result: command.CommandResult) void {
     switch (result) {
-        .ok, .simple_string, .error_msg, .bulk_string, .integer, .nil, .null_array => {},
-        .owned_string => |val| {
-            allocator.free(val);
+        .ok, .simple_string, .error_msg, .integer, .nil, .null_array => {},
+        .owned_string => |maybe_val| {
+            if (maybe_val) |val| {
+                allocator.free(val);
+            }
         },
         .array => |maybe_items| {
             if (maybe_items) |items| {
