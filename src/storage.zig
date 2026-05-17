@@ -378,8 +378,11 @@ pub const Database = struct {
         const cf_arr = self.allocator.alloc(?*const rocksdb.rocksdb_column_family_handle_t, n) catch return error.ReadFailed;
         defer self.allocator.free(cf_arr);
         const val_ptrs = self.allocator.alloc([*c]u8, n) catch return error.ReadFailed;
+        defer self.allocator.free(val_ptrs);
         const val_lens = self.allocator.alloc(usize, n) catch return error.ReadFailed;
+        defer self.allocator.free(val_lens);
         const errs = self.allocator.alloc([*c]u8, n) catch return error.ReadFailed;
+        defer self.allocator.free(errs);
 
         for (keys, 0..) |k, i| {
             key_ptrs[i] = k.ptr;
@@ -413,9 +416,6 @@ pub const Database = struct {
                 results[i] = null;
             }
         }
-        self.allocator.free(val_lens);
-        self.allocator.free(errs);
-        self.allocator.free(val_ptrs);
 
         return results;
     }

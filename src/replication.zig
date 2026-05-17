@@ -510,7 +510,9 @@ fn doHandshake(reader: *std.Io.Reader, writer: *std.Io.Writer, config: ReplicaCo
     writer.writeAll("*1\r\n$4\r\nPING\r\n") catch return false;
     writer.flush() catch return false;
     const pong = reader.takeDelimiterInclusive('\n') catch return false;
-    if (pong.len < 1 or pong[0] != '+') {
+    if (pong.len < 1) return false;
+    // Accept +PONG or -NOAUTH (when master requires auth, we'll AUTH next)
+    if (pong[0] != '+' and !(pong[0] == '-' and config.masterauth != null)) {
         log.err("Handshake: expected +PONG, got {s}", .{pong});
         return false;
     }
