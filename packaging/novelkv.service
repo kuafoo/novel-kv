@@ -1,0 +1,38 @@
+[Unit]
+Description=NovelKV - High-performance text KV storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=novelkv
+Group=novelkv
+
+ExecStart=__BIN_PATH__ $NOVELKV_OPTS
+EnvironmentFile=-/etc/novelkv/novelkv.conf
+
+WorkingDirectory=/var/lib/novelkv
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+LimitNOFILE=65535
+
+ProtectSystem=strict
+ReadWritePaths=/var/lib/novelkv /var/log/novelkv
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=novelkv
+
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
