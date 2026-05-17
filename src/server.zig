@@ -77,6 +77,10 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Datab
 }
 
 fn handleConnectionInner(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, reader: *std.Io.Reader, writer: *std.Io.Writer, stream: std.Io.net.Stream, port: u16) std.Io.Cancelable!void {
+    _ = db.total_connections.fetchAdd(1, .monotonic);
+    _ = db.current_connections.fetchAdd(1, .monotonic);
+    defer _ = db.current_connections.fetchSub(1, .monotonic);
+
     var client = command.ClientState{ .io = io, .port = port };
 
     while (true) {

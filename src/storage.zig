@@ -65,6 +65,13 @@ pub const Database = struct {
     tls_auth: ?tls.config.CertKeyPair = null,
     /// TLS 配置
     tls_config: ?TlsConfig = null,
+    /// 服务器统计计数器
+    total_connections: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    current_connections: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    total_commands: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    total_reads: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    total_writes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    start_time: i64 = 0, // epoch seconds
 
     /// 打开或创建数据库。首次启动时自动创建 16 个 Column Family。
     /// 配置 Bloom Filter、Block Cache、Compaction 调优、Statistics 等引擎参数。
@@ -265,6 +272,11 @@ pub const Database = struct {
             const write_options = rocksdb.rocksdb_writeoptions_create() orelse return error.OpenFailed;
 
             log.info("Database created: {s} ({d} column families)", .{ config.path, MAX_DATABASES });
+            const start_time = blk: {
+                var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
+                _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+                break :blk @as(i64, ts.sec);
+            };
             return Database{
                 .db = db,
                 .allocator = allocator,
@@ -276,6 +288,7 @@ pub const Database = struct {
                 .password = config.password,
                 .filter_policy = filter_policy,
                 .block_cache = block_cache,
+                .start_time = start_time,
             };
         }
 
@@ -295,6 +308,11 @@ pub const Database = struct {
         const write_options = rocksdb.rocksdb_writeoptions_create() orelse return error.OpenFailed;
 
         log.info("Database opened: {s} ({d} column families)", .{ config.path, MAX_DATABASES });
+        const start_time = blk: {
+            var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
+            _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+            break :blk @as(i64, ts.sec);
+        };
         return Database{
             .db = db,
             .allocator = allocator,
@@ -306,6 +324,7 @@ pub const Database = struct {
             .password = config.password,
             .filter_policy = filter_policy,
             .block_cache = block_cache,
+            .start_time = start_time,
         };
     }
 
@@ -319,6 +338,49 @@ pub const Database = struct {
         if (self.block_cache) |bc| rocksdb.rocksdb_cache_destroy(bc);
         rocksdb.rocksdb_close(self.db);
         log.info("Database closed", .{});
+    }
+
+    /// 读取进程内存信息（VmRSS / VmSize），从 /proc/self/status 解析
+    pub fn getProcessMemory() struct { rss: u64, vm: u64 } {
+        const fd = std.os.linux.open("/proc/self/status", .{}, 0);
+        if (fd < 0) return .{ .rss = 0, .vm = 0 };
+        defer _ = std.os.linux.close(@intCast(fd));
+
+        var buf: [4096]u8 = undefined;
+        const n = std.os.linux.read(@intCast(fd), buf[0..].ptr, buf.len);
+        if (n <= 0) return .{ .rss = 0, .vm = 0 };
+        const content = buf[0..@intCast(n)];
+
+        var rss: u64 = 0;
+        var vm: u64 = 0;
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "VmRSS:")) {
+                const val = std.mem.trim(u8, line["VmRSS:".len..], " \t");
+                rss = std.fmt.parseInt(u64, std.mem.sliceTo(val, ' '), 10) catch 0;
+            } else if (std.mem.startsWith(u8, line, "VmSize:")) {
+                const val = std.mem.trim(u8, line["VmSize:".len..], " \t");
+                vm = std.fmt.parseInt(u64, std.mem.sliceTo(val, ' '), 10) catch 0;
+            }
+        }
+        return .{ .rss = rss, .vm = vm };
+    }
+
+    /// 获取所有数据库的 key 数量（keyspace 信息）
+    pub fn getKeyspaceInfo(self: *Database, allocator: std.mem.Allocator) ![]const u8 {
+        var parts = std.ArrayList([]const u8).initCapacity(allocator, 16) catch return "";
+        defer {
+            for (parts.items) |p| allocator.free(p);
+            parts.deinit(allocator);
+        }
+        for (0..MAX_DATABASES) |i| {
+            const count = self.estimateKeyCount(i);
+            if (count > 0) {
+                const line = std.fmt.allocPrint(allocator, "db{d}:keys={d}\r\n", .{ i, count }) catch continue;
+                parts.appendAssumeCapacity(line);
+            }
+        }
+        return std.mem.join(allocator, "", parts.items);
     }
 
     // ---- RwLock 并发控制 ----
@@ -566,7 +628,7 @@ pub const Database = struct {
     }
 
     /// Iterator 范围扫描：从 prefix 开始，返回最多 limit 个 key。
-    /// 调用方负责释放返回的 keys 数组及其中每个元素。
+    /// limit=0 表示不限数量。调用方负责释放返回的 keys 数组及其中每个元素。
     pub fn scanKeys(self: *Database, allocator: std.mem.Allocator, prefix: []const u8, db_index: usize, limit: usize) ![]const []const u8 {
         const cf = self.cf_handles[db_index];
         const iter = rocksdb.rocksdb_create_iterator_cf(self.db, self.read_options, cf);
@@ -578,15 +640,15 @@ pub const Database = struct {
             rocksdb.rocksdb_iter_seek_to_first(iter);
         }
 
-        var keys = std.ArrayList([]const u8).initCapacity(allocator, @min(limit, 256)) catch
+        const cap: usize = if (limit == 0) 256 else @min(limit, 256);
+        var keys = std.ArrayList([]const u8).initCapacity(allocator, cap) catch
             return &.{};
 
-        while (rocksdb.rocksdb_iter_valid(iter) != 0 and keys.items.len < limit) {
+        while (rocksdb.rocksdb_iter_valid(iter) != 0 and (limit == 0 or keys.items.len < limit)) {
             var key_len: usize = 0;
             const key = rocksdb.rocksdb_iter_key(iter, &key_len);
             if (key_len == 0) break;
 
-            // 前缀不匹配时停止（RocksDB 按 key 有序排列）
             if (prefix.len > 0) {
                 if (key_len < prefix.len or !std.mem.eql(u8, key[0..prefix.len], prefix)) {
                     break;
@@ -601,7 +663,7 @@ pub const Database = struct {
         return keys.toOwnedSlice(allocator) catch &.{};
     }
 
-    /// Iterator 范围扫描：返回 key-value 对。
+    /// Iterator 范围扫描：返回 key-value 对。limit=0 表示不限数量。
     pub fn scanKeyValues(self: *Database, allocator: std.mem.Allocator, prefix: []const u8, db_index: usize, limit: usize) ![]const KeyValue {
         const cf = self.cf_handles[db_index];
         const iter = rocksdb.rocksdb_create_iterator_cf(self.db, self.read_options, cf);
@@ -613,10 +675,11 @@ pub const Database = struct {
             rocksdb.rocksdb_iter_seek_to_first(iter);
         }
 
-        var items = std.ArrayList(KeyValue).initCapacity(allocator, @min(limit, 256)) catch
+        const cap: usize = if (limit == 0) 256 else @min(limit, 256);
+        var items = std.ArrayList(KeyValue).initCapacity(allocator, cap) catch
             return &.{};
 
-        while (rocksdb.rocksdb_iter_valid(iter) != 0 and items.items.len < limit) {
+        while (rocksdb.rocksdb_iter_valid(iter) != 0 and (limit == 0 or items.items.len < limit)) {
             var key_len: usize = 0;
             var val_len: usize = 0;
             const key = rocksdb.rocksdb_iter_key(iter, &key_len);
@@ -639,6 +702,70 @@ pub const Database = struct {
         }
 
         return items.toOwnedSlice(allocator) catch &.{};
+    }
+
+    /// 游标扫描：从 start_key 开始返回 limit 个 key，附带下一轮 cursor。
+    /// next_key 为 null 表示遍历完毕（客户端应使用 cursor "0"）。
+    pub fn scanFromCursor(self: *Database, allocator: std.mem.Allocator, start_key: ?[]const u8, db_index: usize, limit: usize) !struct { keys: [][]const u8, next_key: ?[]const u8 } {
+        const cf = self.cf_handles[db_index];
+        const iter = rocksdb.rocksdb_create_iterator_cf(self.db, self.read_options, cf);
+        defer rocksdb.rocksdb_iter_destroy(iter);
+
+        if (start_key) |sk| {
+            rocksdb.rocksdb_iter_seek(iter, sk.ptr, sk.len);
+            // 跳过 cursor 自身（它是上一轮最后一个 key）
+            if (rocksdb.rocksdb_iter_valid(iter) != 0) {
+                rocksdb.rocksdb_iter_next(iter);
+            }
+        } else {
+            rocksdb.rocksdb_iter_seek_to_first(iter);
+        }
+
+        var keys = std.ArrayList([]const u8).initCapacity(allocator, @min(limit, 256)) catch
+            return .{ .keys = &.{}, .next_key = null };
+
+        while (rocksdb.rocksdb_iter_valid(iter) != 0 and keys.items.len < limit) {
+            var key_len: usize = 0;
+            const key = rocksdb.rocksdb_iter_key(iter, &key_len);
+            if (key_len == 0) break;
+
+            const duped = allocator.dupe(u8, key[0..key_len]) catch break;
+            keys.appendAssumeCapacity(duped);
+            rocksdb.rocksdb_iter_next(iter);
+        }
+
+        // 如果迭代器还有数据，取当前 key 作为下一轮 cursor
+        var next_key: ?[]const u8 = null;
+        if (rocksdb.rocksdb_iter_valid(iter) != 0) {
+            var nk_len: usize = 0;
+            const nk = rocksdb.rocksdb_iter_key(iter, &nk_len);
+            if (nk_len > 0) {
+                next_key = allocator.dupe(u8, nk[0..nk_len]) catch null;
+            }
+        }
+
+        return .{
+            .keys = keys.toOwnedSlice(allocator) catch &.{},
+            .next_key = next_key,
+        };
+    }
+
+    /// 获取压缩统计：原始数据估算 vs 压缩后 SST 大小
+    pub fn getCompressionStats(self: *Database, db_index: usize) struct { live_data_size: u64, sst_size: u64, ratio: f64 } {
+        const cf = self.cf_handles[db_index];
+
+        var live_data: u64 = 0;
+        _ = rocksdb.rocksdb_property_int_cf(self.db, cf, "rocksdb.estimate-live-data-size", &live_data);
+
+        var sst_size: u64 = 0;
+        const val: [*c]u8 = rocksdb.rocksdb_property_value_cf(self.db, cf, "rocksdb.total-sst-files-size");
+        if (val) |v| {
+            sst_size = std.fmt.parseInt(u64, std.mem.sliceTo(v, 0), 10) catch 0;
+            rocksdb.rocksdb_free(v);
+        }
+
+        const ratio: f64 = if (sst_size > 0) @as(f64, @floatFromInt(live_data)) / @as(f64, @floatFromInt(sst_size)) else 0.0;
+        return .{ .live_data_size = live_data, .sst_size = sst_size, .ratio = ratio };
     }
 
     pub fn atomicPut(self: *Database, pairs: []const KeyValue, db_index: usize) !void {

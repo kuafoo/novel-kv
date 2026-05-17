@@ -33,6 +33,8 @@ const write_command_set = std.StaticStringMap(void).initComptime(.{
     .{ "decrby", {} },
     .{ "flushdb", {} },
     .{ "flushall", {} },
+    .{ "hset", {} },
+    .{ "hdel", {} },
 });
 
 pub fn isWriteCommand(cmd: []const u8) bool {

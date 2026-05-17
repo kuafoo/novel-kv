@@ -74,6 +74,15 @@ const cmd_table = std.StaticStringMap(CmdFn).initComptime(.{
     .{ "bgsave", &cmdBgsave },
     .{ "auth", &cmdAuth },
     .{ "scan", &cmdScan },
+    .{ "keys", &cmdKeys },
+    .{ "hset", &cmdHSet },
+    .{ "hget", &cmdHGet },
+    .{ "hdel", &cmdHDel },
+    .{ "hexists", &cmdHExists },
+    .{ "hlen", &cmdHLen },
+    .{ "hgetall", &cmdHGetAll },
+    .{ "hkeys", &cmdHKeys },
+    .{ "hvals", &cmdHVals },
     .{ "replconf", &cmdReplconf },
     .{ "psync", &cmdPsync },
 });
@@ -109,6 +118,13 @@ pub fn execute(db: *storage.Database, allocator: std.mem.Allocator, args: []resp
         return CommandResult{ .error_msg = "READONLY You can't write against a read only replica" };
     }
 
+    // 统计命令计数
+    _ = db.total_commands.fetchAdd(1, .monotonic);
+    if (replication.isWriteCommand(cmd)) {
+        _ = db.total_writes.fetchAdd(1, .monotonic);
+    } else {
+        _ = db.total_reads.fetchAdd(1, .monotonic);
+    }
     const result = handler(db, allocator, args, client);
 
     // 主端：写命令记录到 oplog 并广播给副本
@@ -583,33 +599,62 @@ fn cmdInfo(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
     const pid = std.posix.system.getpid();
     const role = if (db.is_replica) "replica" else "master";
     const tls_status = if (db.tls_config != null) "yes" else "no";
+    const uptime = blk: {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+        break :blk ts.sec - db.start_time;
+    };
+    const mem = storage.Database.getProcessMemory();
+    const total_conn = db.total_connections.load(.monotonic);
+    const current_conn = db.current_connections.load(.monotonic);
+    const total_cmds = db.total_commands.load(.monotonic);
+    const total_reads = db.total_reads.load(.monotonic);
+    const total_writes = db.total_writes.load(.monotonic);
 
     // 复制信息
     var repl_info: []const u8 = "";
     if (db.is_replica) {
         const connected = db.is_replica_connected.load(.acquire);
         repl_info = std.fmt.allocPrint(allocator,
-            "\r\n# Replication\r\nrole:{s}\r\nmaster_link_status:{s}\r\n",
+            "role:{s}\r\nmaster_link_status:{s}\r\n",
             .{ role, if (connected) "up" else "down" },
         ) catch "";
     } else if (db.repl) |repl| {
         const replica_count = repl.replicas.count(client.io);
         repl_info = std.fmt.allocPrint(allocator,
-            "\r\n# Replication\r\nrole:{s}\r\nconnected_replicas:{d}\r\n",
+            "role:{s}\r\nconnected_replicas:{d}\r\n",
             .{ role, replica_count },
         ) catch "";
     } else {
         repl_info = std.fmt.allocPrint(allocator,
-            "\r\n# Replication\r\nrole:{s}\r\nconnected_replicas:0\r\n",
+            "role:{s}\r\nconnected_replicas:0\r\n",
             .{role},
         ) catch "";
     }
     defer allocator.free(repl_info);
 
+    // Section-specific output
     if (args.len > 1) {
         const section = getStringArg(args, 1) orelse "";
         if (std.mem.eql(u8, section, "server")) {
-            const info = std.fmt.allocPrint(allocator, "# Server\r\nnovelkv_version:1.0.0\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\ntls_enabled:{s}\r\n{s}", .{ client.port, pid, tls_status, repl_info }) catch return CommandResult{ .error_msg = "ERR out of memory" };
+            const info = std.fmt.allocPrint(allocator,
+                "# Server\r\nnovelkv_version:1.1.0\r\nengine:rocksdb+Zstd+bloom\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\nuptime_in_seconds:{d}\r\ntls_enabled:{s}\r\n",
+                .{ client.port, pid, uptime, tls_status },
+            ) catch return CommandResult{ .error_msg = "ERR out of memory" };
+            return CommandResult{ .owned_string = info };
+        }
+        if (std.mem.eql(u8, section, "clients")) {
+            const info = std.fmt.allocPrint(allocator,
+                "# Clients\r\nconnected_clients:{d}\r\ntotal_connections_received:{d}\r\n",
+                .{ current_conn, total_conn },
+            ) catch return CommandResult{ .error_msg = "ERR out of memory" };
+            return CommandResult{ .owned_string = info };
+        }
+        if (std.mem.eql(u8, section, "memory")) {
+            const info = std.fmt.allocPrint(allocator,
+                "# Memory\r\nused_memory_rss_kb:{d}\r\nused_memory_vm_kb:{d}\r\n",
+                .{ mem.rss, mem.vm },
+            ) catch return CommandResult{ .error_msg = "ERR out of memory" };
             return CommandResult{ .owned_string = info };
         }
         if (std.mem.eql(u8, section, "stats")) {
@@ -617,22 +662,56 @@ fn cmdInfo(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
             const cf_stats = db.getCFStats(client.db_index);
             const key_count = db.estimateKeyCount(client.db_index);
             const info = std.fmt.allocPrint(allocator,
-                "# Stats\r\ndb{d}_keys:{d}\r\ndb{d}_sst_files:{d}\r\ndb{d}_sst_size_bytes:{d}\r\nblock_cache_usage:{d}\r\nblock_cache_capacity:{d}\r\n{s}",
-                .{ client.db_index, key_count, client.db_index, cf_stats.live_sst_files, client.db_index, cf_stats.live_sst_size, cache.usage, cache.capacity, repl_info },
+                "# Stats\r\ntotal_commands_processed:{d}\r\ntotal_reads:{d}\r\ntotal_writes:{d}\r\ndb{d}_keys:{d}\r\ndb{d}_sst_files:{d}\r\ndb{d}_sst_size_bytes:{d}\r\nblock_cache_usage:{d}\r\nblock_cache_capacity:{d}\r\n",
+                .{ total_cmds, total_reads, total_writes, client.db_index, key_count, client.db_index, cf_stats.live_sst_files, client.db_index, cf_stats.live_sst_size, cache.usage, cache.capacity },
             ) catch return CommandResult{ .error_msg = "ERR out of memory" };
             return CommandResult{ .owned_string = info };
         }
         if (std.mem.eql(u8, section, "replication")) {
-            const info = std.fmt.allocPrint(allocator, "# Replication\r\nrole:{s}\r\n{s}", .{ role, repl_info }) catch return CommandResult{ .error_msg = "ERR out of memory" };
+            const info = std.fmt.allocPrint(allocator, "# Replication\r\n{s}", .{repl_info}) catch return CommandResult{ .error_msg = "ERR out of memory" };
+            return CommandResult{ .owned_string = info };
+        }
+        if (std.mem.eql(u8, section, "compression")) {
+            const comp = db.getCompressionStats(client.db_index);
+            const info = std.fmt.allocPrint(allocator,
+                "# Compression(db{d})\r\nlive_data_size:{d}\r\nsst_size:{d}\r\ncompression_ratio:{d:.2}\r\n",
+                .{ client.db_index, comp.live_data_size, comp.sst_size, comp.ratio },
+            ) catch return CommandResult{ .error_msg = "ERR out of memory" };
+            return CommandResult{ .owned_string = info };
+        }
+        if (std.mem.eql(u8, section, "keyspace")) {
+            const ks = db.getKeyspaceInfo(allocator) catch "";
+            defer allocator.free(ks);
+            const info = std.fmt.allocPrint(allocator, "# Keyspace\r\n{s}", .{ks}) catch return CommandResult{ .error_msg = "ERR out of memory" };
             return CommandResult{ .owned_string = info };
         }
     }
+
+    // Default: all sections
     const cache = db.getCacheStats();
     const cf_stats = db.getCFStats(client.db_index);
     const key_count = db.estimateKeyCount(client.db_index);
+    const comp = db.getCompressionStats(client.db_index);
+    const ks = db.getKeyspaceInfo(allocator) catch "";
+    defer allocator.free(ks);
+
     const info = std.fmt.allocPrint(allocator,
-        "# NovelKV\r\nnovelkv_version:1.0.0\r\nengine:rocksdb+Zstd+bloom\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\ntls_enabled:{s}\r\n\r\n# Stats(db{d})\r\nkeys:{d}\r\nsst_files:{d}\r\nsst_size_bytes:{d}\r\nblock_cache_usage:{d}\r\nblock_cache_capacity:{d}\r\n{s}",
-        .{ client.port, pid, tls_status, client.db_index, key_count, cf_stats.live_sst_files, cf_stats.live_sst_size, cache.usage, cache.capacity, repl_info },
+        "# Server\r\nnovelkv_version:1.1.0\r\nengine:rocksdb+Zstd+bloom\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\nuptime_in_seconds:{d}\r\ntls_enabled:{s}\r\n" ++
+        "\r\n# Clients\r\nconnected_clients:{d}\r\ntotal_connections_received:{d}\r\n" ++
+        "\r\n# Memory\r\nused_memory_rss_kb:{d}\r\nused_memory_vm_kb:{d}\r\n" ++
+        "\r\n# Stats\r\ntotal_commands_processed:{d}\r\ntotal_reads:{d}\r\ntotal_writes:{d}\r\ndb{d}_keys:{d}\r\ndb{d}_sst_files:{d}\r\ndb{d}_sst_size_bytes:{d}\r\nblock_cache_usage:{d}\r\nblock_cache_capacity:{d}\r\n" ++
+        "\r\n# Compression(db{d})\r\nlive_data_size:{d}\r\nsst_size:{d}\r\ncompression_ratio:{d:.2}\r\n" ++
+        "\r\n# Replication\r\n{s}" ++
+        "\r\n# Keyspace\r\n{s}",
+        .{
+            client.port, pid, uptime, tls_status,
+            current_conn, total_conn,
+            mem.rss, mem.vm,
+            total_cmds, total_reads, total_writes, client.db_index, key_count, client.db_index, cf_stats.live_sst_files, client.db_index, cf_stats.live_sst_size, cache.usage, cache.capacity,
+            client.db_index, comp.live_data_size, comp.sst_size, comp.ratio,
+            repl_info,
+            ks,
+        },
     ) catch return CommandResult{ .error_msg = "ERR out of memory" };
     return CommandResult{ .owned_string = info };
 }
@@ -792,33 +871,470 @@ fn cmdBgsave(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.R
     return CommandResult{ .owned_string = msg };
 }
 
-/// SCAN：基于游标的渐进式 key 扫描，支持 MATCH 前缀过滤和 COUNT 限制。
+/// SCAN：基于游标的渐进式 key 扫描，支持 MATCH 模式匹配和 COUNT 限制。
 /// 格式：SCAN <cursor> [MATCH <pattern>] [COUNT <count>]
 fn cmdScan(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
-    _ = args;
-    // 当前简化实现：每次返回一批 key，cursor 固定返回 "0" 表示结束
-    const keys = db.scanKeys(allocator, "", client.db_index, 100) catch
-        return CommandResult{ .error_msg = "ERR scan failed" };
+    if (args.len < 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'scan' command" };
 
-    if (keys.len == 0) {
-        const result_items = allocator.alloc(CommandResult, 2) catch return CommandResult{ .error_msg = "ERR out of memory" };
-        result_items[0] = CommandResult{ .owned_string = allocator.dupe(u8, "0") catch return CommandResult{ .error_msg = "ERR out of memory" } };
-        result_items[1] = CommandResult{ .array = allocator.alloc(CommandResult, 0) catch &.{} };
-        return CommandResult{ .array = result_items };
+    const cursor_str = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid cursor" };
+
+    // 解析可选参数 MATCH 和 COUNT
+    var match_pattern: ?[]const u8 = null;
+    var count: usize = 100;
+
+    var i: usize = 2;
+    while (i < args.len) {
+        const opt = getStringArg(args, i) orelse {
+            i += 1;
+            continue;
+        };
+        var buf: [16]u8 = undefined;
+        const opt_lower = std.ascii.lowerString(&buf, opt);
+        if (std.mem.eql(u8, opt_lower, "match") and i + 1 < args.len) {
+            match_pattern = getStringArg(args, i + 1);
+            i += 2;
+        } else if (std.mem.eql(u8, opt_lower, "count") and i + 1 < args.len) {
+            const count_str = getStringArg(args, i + 1) orelse "";
+            count = std.fmt.parseInt(usize, count_str, 10) catch 100;
+            if (count == 0) count = 100;
+            i += 2;
+        } else {
+            i += 1;
+        }
     }
 
-    // 将 keys 转为 CommandResult 数组
-    const key_results = allocator.alloc(CommandResult, keys.len) catch return CommandResult{ .error_msg = "ERR out of memory" };
-    for (keys, 0..) |k, i| {
-        key_results[i] = CommandResult{ .owned_string = k };
+    // cursor "0" 表示从头开始，否则从指定 key 继续
+    const start_key: ?[]const u8 = if (cursor_str.len > 0 and !std.mem.eql(u8, cursor_str, "0")) cursor_str else null;
+
+    // 如果有 MATCH 且不含 *，作为前缀使用以缩小扫描范围
+    const scan_result = db.scanFromCursor(allocator, start_key, client.db_index, count) catch
+        return CommandResult{ .error_msg = "ERR scan failed" };
+
+    // 过滤匹配的 key
+    var filtered = std.ArrayList([]const u8).initCapacity(allocator, scan_result.keys.len) catch
+        return CommandResult{ .error_msg = "ERR out of memory" };
+
+    for (scan_result.keys) |k| {
+        if (match_pattern) |pat| {
+            if (globMatch(pat, k)) {
+                filtered.appendAssumeCapacity(k);
+            } else {
+                allocator.free(k);
+            }
+        } else {
+            filtered.appendAssumeCapacity(k);
+        }
+    }
+    allocator.free(scan_result.keys);
+
+    // 构建 cursor
+    const cursor_result: []const u8 = if (scan_result.next_key) |nk| nk else "0";
+
+    const result_items = allocator.alloc(CommandResult, 2) catch return CommandResult{ .error_msg = "ERR out of memory" };
+    result_items[0] = CommandResult{ .owned_string = allocator.dupe(u8, cursor_result) catch return CommandResult{ .error_msg = "ERR out of memory" } };
+
+    const key_results = allocator.alloc(CommandResult, filtered.items.len) catch return CommandResult{ .error_msg = "ERR out of memory" };
+    for (filtered.items, 0..) |k, idx| {
+        key_results[idx] = CommandResult{ .owned_string = k };
+    }
+    filtered.deinit(allocator);
+    result_items[1] = CommandResult{ .array = key_results };
+
+    return CommandResult{ .array = result_items };
+}
+
+/// KEYS：返回匹配 pattern 的所有 key。大数据集会阻塞。
+fn cmdKeys(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    if (args.len < 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'keys' command" };
+    const pattern = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid pattern" };
+
+    // 无通配符的精确匹配请求使用前缀优化
+    const keys = db.scanKeys(allocator, "", client.db_index, 0) catch
+        return CommandResult{ .error_msg = "ERR scan failed" };
+
+    var matched = std.ArrayList([]const u8).initCapacity(allocator, keys.len) catch
+        return CommandResult{ .error_msg = "ERR out of memory" };
+
+    for (keys) |k| {
+        if (globMatch(pattern, k)) {
+            matched.appendAssumeCapacity(k);
+        } else {
+            allocator.free(k);
+        }
     }
     allocator.free(keys);
 
-    // SCAN 回复格式：[cursor, [key1, key2, ...]]
-    const result_items = allocator.alloc(CommandResult, 2) catch return CommandResult{ .error_msg = "ERR out of memory" };
-    result_items[0] = CommandResult{ .owned_string = allocator.dupe(u8, "0") catch return CommandResult{ .error_msg = "ERR out of memory" } };
-    result_items[1] = CommandResult{ .array = key_results };
-    return CommandResult{ .array = result_items };
+    const results = allocator.alloc(CommandResult, matched.items.len) catch return CommandResult{ .error_msg = "ERR out of memory" };
+    for (matched.items, 0..) |k, idx| {
+        results[idx] = CommandResult{ .owned_string = k };
+    }
+    matched.deinit(allocator);
+
+    return CommandResult{ .array = results };
+}
+
+// ============================================================
+// Glob 匹配
+// ============================================================
+
+/// 简易 glob 匹配：支持 * 通配符
+fn globMatch(pattern: []const u8, text: []const u8) bool {
+    return globMatchRecursive(pattern, 0, text, 0);
+}
+
+fn globMatchRecursive(pattern: []const u8, pi: usize, text: []const u8, ti: usize) bool {
+    var p = pi;
+    var t = ti;
+
+    while (p < pattern.len) {
+        if (pattern[p] == '*') {
+            p += 1;
+            // 连续 * 等同于一个 *
+            while (p < pattern.len and pattern[p] == '*') p += 1;
+            // * 在末尾，匹配剩余所有
+            if (p == pattern.len) return true;
+            // 尝试从每个位置匹配 *
+            var i: usize = t;
+            while (i <= text.len) {
+                if (globMatchRecursive(pattern, p, text, i)) return true;
+                i += 1;
+            }
+            return false;
+        } else {
+            if (t >= text.len) return false;
+            if (pattern[p] != '?' and pattern[p] != text[t]) return false;
+            p += 1;
+            t += 1;
+        }
+    }
+    return t == text.len;
+}
+
+// ============================================================
+// Hash 命令（Meta + Data 双 key）
+// Meta: "HM:{key}" → varint(field_count)
+// Data: "H:{key}:{field}" → value
+// ============================================================
+
+const HASH_DATA_PREFIX = "H:";
+const HASH_META_PREFIX = "HM:";
+const WRONGTYPE = "WRONGTYPE Operation against a key holding the wrong kind of value";
+
+fn hashFieldKey(allocator: std.mem.Allocator, hash_key: []const u8, field: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}:{s}", .{ HASH_DATA_PREFIX, hash_key, field });
+}
+
+fn hashFieldPrefix(allocator: std.mem.Allocator, hash_key: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}:", .{ HASH_DATA_PREFIX, hash_key });
+}
+
+fn hashMetaKey(allocator: std.mem.Allocator, hash_key: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ HASH_META_PREFIX, hash_key });
+}
+
+fn extractFieldName(prefix: []const u8, full_key: []const u8) []const u8 {
+    if (full_key.len > prefix.len) {
+        return full_key[prefix.len..];
+    }
+    return full_key;
+}
+
+/// 编码 field count 为 ASCII 数字字符串（简单可靠）
+fn encodeCount(allocator: std.mem.Allocator, count: u64) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{d}", .{count});
+}
+
+/// 解码 field count
+fn decodeCount(data: []const u8) u64 {
+    return std.fmt.parseInt(u64, data, 10) catch 0;
+}
+
+const HashType = enum { is_hash, is_other, not_exist };
+
+/// 类型检查：hash meta 存在 → is_hash；原始 key 存在 → is_other；都不存在 → not_exist
+fn checkHashType(db: *storage.Database, allocator: std.mem.Allocator, hash_key: []const u8, db_index: usize) HashType {
+    const meta_key = hashMetaKey(allocator, hash_key) catch return .not_exist;
+    defer allocator.free(meta_key);
+    const meta_val = db.get(meta_key, db_index) catch return .not_exist;
+    if (meta_val) |v| {
+        storage.freeValue(v);
+        return .is_hash;
+    }
+    // meta 不存在，检查原始 key 是否作为 string 存在
+    const raw_val = db.get(hash_key, db_index) catch return .not_exist;
+    if (raw_val) |v| {
+        storage.freeValue(v);
+        return .is_other;
+    }
+    return .not_exist;
+}
+
+/// 读取 meta 中的 field count。meta 不存在返回 0。
+fn getHashCount(db: *storage.Database, allocator: std.mem.Allocator, hash_key: []const u8, db_index: usize) u64 {
+    const meta_key = hashMetaKey(allocator, hash_key) catch return 0;
+    defer allocator.free(meta_key);
+    const meta_val = db.get(meta_key, db_index) catch return 0;
+    if (meta_val) |v| {
+        const count = decodeCount(v);
+        storage.freeValue(v);
+        return count;
+    }
+    return 0;
+}
+
+/// 写入 meta field count
+fn setHashCount(db: *storage.Database, allocator: std.mem.Allocator, hash_key: []const u8, count: u64, db_index: usize) !void {
+    const meta_key = try hashMetaKey(allocator, hash_key);
+    defer allocator.free(meta_key);
+    const count_str = try encodeCount(allocator, count);
+    defer allocator.free(count_str);
+    try db.put(meta_key, count_str, db_index);
+}
+
+/// 删除 meta key
+fn deleteHashMeta(db: *storage.Database, allocator: std.mem.Allocator, hash_key: []const u8, db_index: usize) void {
+    const meta_key = hashMetaKey(allocator, hash_key) catch return;
+    defer allocator.free(meta_key);
+    db.delete(meta_key, db_index) catch {};
+}
+
+/// HSET key field value [field value ...]
+fn cmdHSet(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    if (args.len < 4 or (args.len % 2) != 0)
+        return CommandResult{ .error_msg = "ERR wrong number of arguments for 'hset' command" };
+
+    const hash_key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid key" };
+
+    // 类型检查
+    switch (checkHashType(db, allocator, hash_key, client.db_index)) {
+        .is_other => return CommandResult{ .error_msg = WRONGTYPE },
+        else => {},
+    }
+
+    var count = getHashCount(db, allocator, hash_key, client.db_index);
+    var new_fields: i64 = 0;
+    var idx: usize = 2;
+    while (idx + 1 < args.len) {
+        const field = getStringArg(args, idx) orelse return CommandResult{ .error_msg = "ERR invalid field" };
+        const value = getStringArg(args, idx + 1) orelse return CommandResult{ .error_msg = "ERR invalid value" };
+
+        const internal_key = hashFieldKey(allocator, hash_key, field) catch
+            return CommandResult{ .error_msg = "ERR out of memory" };
+        defer allocator.free(internal_key);
+
+        // 检查 field 是否已存在
+        const existing = db.get(internal_key, client.db_index) catch null;
+        if (existing) |v| {
+            storage.freeValue(v);
+        } else {
+            count += 1;
+            new_fields += 1;
+        }
+
+        db.put(internal_key, value, client.db_index) catch
+            return CommandResult{ .error_msg = "ERR write failed" };
+        idx += 2;
+    }
+
+    // 更新 meta
+    setHashCount(db, allocator, hash_key, count, client.db_index) catch
+        return CommandResult{ .error_msg = "ERR write failed" };
+
+    return CommandResult{ .integer = new_fields };
+}
+
+/// HGET key field
+fn cmdHGet(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    if (args.len != 3) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'hget' command" };
+
+    const hash_key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid key" };
+
+    switch (checkHashType(db, allocator, hash_key, client.db_index)) {
+        .is_other => return CommandResult{ .error_msg = WRONGTYPE },
+        else => {},
+    }
+
+    const field = getStringArg(args, 2) orelse return CommandResult{ .error_msg = "ERR invalid field" };
+    const internal_key = hashFieldKey(allocator, hash_key, field) catch
+        return CommandResult{ .error_msg = "ERR out of memory" };
+    defer allocator.free(internal_key);
+
+    const val = db.get(internal_key, client.db_index) catch return CommandResult{ .error_msg = "ERR read failed" };
+    if (val) |v| {
+        const duped = allocator.dupe(u8, v) catch {
+            storage.freeValue(v);
+            return CommandResult{ .error_msg = "ERR out of memory" };
+        };
+        storage.freeValue(v);
+        return CommandResult{ .owned_string = duped };
+    }
+    return CommandResult{ .nil = {} };
+}
+
+/// HDEL key field [field ...]
+fn cmdHDel(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    if (args.len < 3) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'hdel' command" };
+
+    const hash_key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid key" };
+
+    switch (checkHashType(db, allocator, hash_key, client.db_index)) {
+        .is_other => return CommandResult{ .error_msg = WRONGTYPE },
+        .not_exist => return CommandResult{ .integer = 0 },
+        .is_hash => {},
+    }
+
+    var count = getHashCount(db, allocator, hash_key, client.db_index);
+    var deleted: i64 = 0;
+
+    for (args[2..]) |arg| {
+        const field: ?[]const u8 = switch (arg) {
+            .bulk_string => |s| s,
+            else => null,
+        };
+        const f = field orelse continue;
+        const internal_key = hashFieldKey(allocator, hash_key, f) catch continue;
+        defer allocator.free(internal_key);
+
+        const existing = db.get(internal_key, client.db_index) catch continue;
+        if (existing) |v| {
+            storage.freeValue(v);
+            db.delete(internal_key, client.db_index) catch continue;
+            deleted += 1;
+            if (count > 0) count -= 1;
+        }
+    }
+
+    if (count == 0) {
+        deleteHashMeta(db, allocator, hash_key, client.db_index);
+    } else {
+        setHashCount(db, allocator, hash_key, count, client.db_index) catch {};
+    }
+
+    return CommandResult{ .integer = deleted };
+}
+
+/// HEXISTS key field
+fn cmdHExists(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    if (args.len != 3) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'hexists' command" };
+
+    const hash_key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid key" };
+
+    switch (checkHashType(db, allocator, hash_key, client.db_index)) {
+        .is_other => return CommandResult{ .error_msg = WRONGTYPE },
+        else => {},
+    }
+
+    const field = getStringArg(args, 2) orelse return CommandResult{ .error_msg = "ERR invalid field" };
+    const internal_key = hashFieldKey(allocator, hash_key, field) catch
+        return CommandResult{ .error_msg = "ERR out of memory" };
+    defer allocator.free(internal_key);
+
+    const val = db.get(internal_key, client.db_index) catch return CommandResult{ .integer = 0 };
+    if (val) |v| {
+        storage.freeValue(v);
+        return CommandResult{ .integer = 1 };
+    }
+    return CommandResult{ .integer = 0 };
+}
+
+/// HLEN key — O(1) 从 meta 读取
+fn cmdHLen(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    if (args.len != 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'hlen' command" };
+
+    const hash_key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid key" };
+
+    switch (checkHashType(db, allocator, hash_key, client.db_index)) {
+        .is_other => return CommandResult{ .error_msg = WRONGTYPE },
+        else => {},
+    }
+
+    const count = getHashCount(db, allocator, hash_key, client.db_index);
+    return CommandResult{ .integer = @intCast(count) };
+}
+
+/// HGETALL key
+fn cmdHGetAll(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    if (args.len != 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'hgetall' command" };
+
+    const hash_key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid key" };
+
+    switch (checkHashType(db, allocator, hash_key, client.db_index)) {
+        .is_other => return CommandResult{ .error_msg = WRONGTYPE },
+        else => {},
+    }
+
+    const prefix = hashFieldPrefix(allocator, hash_key) catch
+        return CommandResult{ .error_msg = "ERR out of memory" };
+    defer allocator.free(prefix);
+
+    const kvs = db.scanKeyValues(allocator, prefix, client.db_index, 0) catch
+        return CommandResult{ .error_msg = "ERR scan failed" };
+
+    const results = allocator.alloc(CommandResult, kvs.len * 2) catch return CommandResult{ .error_msg = "ERR out of memory" };
+    for (kvs, 0..) |kv, i| {
+        results[i * 2] = CommandResult{ .owned_string = allocator.dupe(u8, extractFieldName(prefix, kv.key)) catch continue };
+        results[i * 2 + 1] = CommandResult{ .owned_string = kv.value };
+        allocator.free(kv.key);
+    }
+    allocator.free(kvs);
+
+    return CommandResult{ .array = results };
+}
+
+/// HKEYS key
+fn cmdHKeys(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    if (args.len != 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'hkeys' command" };
+
+    const hash_key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid key" };
+
+    switch (checkHashType(db, allocator, hash_key, client.db_index)) {
+        .is_other => return CommandResult{ .error_msg = WRONGTYPE },
+        else => {},
+    }
+
+    const prefix = hashFieldPrefix(allocator, hash_key) catch
+        return CommandResult{ .error_msg = "ERR out of memory" };
+    defer allocator.free(prefix);
+
+    const keys = db.scanKeys(allocator, prefix, client.db_index, 0) catch
+        return CommandResult{ .error_msg = "ERR scan failed" };
+
+    const results = allocator.alloc(CommandResult, keys.len) catch return CommandResult{ .error_msg = "ERR out of memory" };
+    for (keys, 0..) |k, i| {
+        results[i] = CommandResult{ .owned_string = allocator.dupe(u8, extractFieldName(prefix, k)) catch continue };
+        allocator.free(k);
+    }
+    allocator.free(keys);
+
+    return CommandResult{ .array = results };
+}
+
+/// HVALS key
+fn cmdHVals(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    if (args.len != 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'hvals' command" };
+
+    const hash_key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid key" };
+
+    switch (checkHashType(db, allocator, hash_key, client.db_index)) {
+        .is_other => return CommandResult{ .error_msg = WRONGTYPE },
+        else => {},
+    }
+
+    const prefix = hashFieldPrefix(allocator, hash_key) catch
+        return CommandResult{ .error_msg = "ERR out of memory" };
+    defer allocator.free(prefix);
+
+    const kvs = db.scanKeyValues(allocator, prefix, client.db_index, 0) catch
+        return CommandResult{ .error_msg = "ERR scan failed" };
+
+    const results = allocator.alloc(CommandResult, kvs.len) catch return CommandResult{ .error_msg = "ERR out of memory" };
+    for (kvs, 0..) |kv, i| {
+        results[i] = CommandResult{ .owned_string = kv.value };
+        allocator.free(kv.key);
+    }
+    allocator.free(kvs);
+
+    return CommandResult{ .array = results };
 }
 
 // ============================================================
