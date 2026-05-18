@@ -83,6 +83,10 @@ pub const Database = struct {
     total_reads: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total_writes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     start_time: i64 = 0, // epoch seconds
+    /// SCAN 数字游标映射
+    scan_cursor_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    scan_cursor_lock: std.atomic.Mutex = .unlocked,
+    scan_cursor_map: std.AutoHashMap(u64, []const u8),
 
     /// 打开或创建数据库。首次启动时自动创建 16 个 Column Family。
     /// 配置 Bloom Filter、Block Cache、Compaction 调优、Statistics 等引擎参数。
@@ -307,6 +311,7 @@ pub const Database = struct {
                 .filter_policy = filter_policy,
                 .block_cache = block_cache,
                 .start_time = start_time,
+                .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
             };
         }
 
@@ -343,6 +348,7 @@ pub const Database = struct {
             .filter_policy = filter_policy,
             .block_cache = block_cache,
             .start_time = start_time,
+            .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
         };
     }
 
@@ -355,7 +361,32 @@ pub const Database = struct {
         rocksdb.rocksdb_writeoptions_destroy(self.write_options);
         if (self.filter_policy) |fp| rocksdb.rocksdb_filterpolicy_destroy(fp);
         if (self.block_cache) |bc| rocksdb.rocksdb_cache_destroy(bc);
+        var it = self.scan_cursor_map.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.scan_cursor_map.deinit();
         log.info("Database closed", .{});
+    }
+
+    /// 创建 SCAN 数字游标，存储 next_key
+    pub fn scanCursorCreate(self: *Database, key: []const u8) u64 {
+        const id = self.scan_cursor_seq.fetchAdd(1, .monotonic) + 1;
+        const duped = self.allocator.dupe(u8, key) catch return 0;
+        while (!self.scan_cursor_lock.tryLock()) {}
+        defer self.scan_cursor_lock.unlock();
+        self.scan_cursor_map.put(id, duped) catch {
+            self.allocator.free(duped);
+            return 0;
+        };
+        return id;
+    }
+
+    /// 消费 SCAN 游标，返回 start_key（调用方负责 free），不存在返回 null
+    pub fn scanCursorConsume(self: *Database, id: u64) ?[]const u8 {
+        if (id == 0) return null;
+        while (!self.scan_cursor_lock.tryLock()) {}
+        defer self.scan_cursor_lock.unlock();
+        const removed = self.scan_cursor_map.fetchRemove(id) orelse return null;
+        return removed.value;
     }
 
     /// 读取进程内存信息（VmRSS / VmSize），从 /proc/self/status 解析

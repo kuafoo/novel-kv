@@ -873,6 +873,7 @@ fn cmdBgsave(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.R
 
 /// SCAN：基于游标的渐进式 key 扫描，支持 MATCH 模式匹配和 COUNT 限制。
 /// 格式：SCAN <cursor> [MATCH <pattern>] [COUNT <count>]
+/// 游标为 u64 数字（Redis 标准格式），内部映射到 seek key
 fn cmdScan(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
     if (args.len < 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'scan' command" };
 
@@ -903,10 +904,14 @@ fn cmdScan(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
         }
     }
 
-    // cursor "0" 表示从头开始，否则从指定 key 继续
-    const start_key: ?[]const u8 = if (cursor_str.len > 0 and !std.mem.eql(u8, cursor_str, "0")) cursor_str else null;
+    // 解析数字游标，从 cursor map 中取出 seek key
+    const cursor_num = std.fmt.parseInt(u64, cursor_str, 10) catch 0;
+    const consumed_key = db.scanCursorConsume(cursor_num);
+    defer {
+        if (consumed_key) |k| allocator.free(k);
+    }
+    const start_key: ?[]const u8 = consumed_key;
 
-    // 如果有 MATCH 且不含 *，作为前缀使用以缩小扫描范围
     const scan_result = db.scanFromCursor(allocator, start_key, client.db_index, count) catch
         return CommandResult{ .error_msg = "ERR scan failed" };
 
@@ -927,11 +932,25 @@ fn cmdScan(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
     }
     allocator.free(scan_result.keys);
 
-    // 构建 cursor
-    const cursor_result: []const u8 = if (scan_result.next_key) |nk| nk else "0";
+    // 构建数字游标：有 next_key 则创建新 cursor ID，否则返回 "0"
+    const cursor_result: []const u8 = blk: {
+        if (scan_result.next_key) |nk| {
+            const new_id = db.scanCursorCreate(nk);
+            allocator.free(nk);
+            if (new_id > 0) {
+                break :blk std.fmt.allocPrint(allocator, "{d}", .{new_id}) catch "0";
+            }
+        }
+        break :blk "0";
+    };
 
     const result_items = allocator.alloc(CommandResult, 2) catch return CommandResult{ .error_msg = "ERR out of memory" };
     result_items[0] = CommandResult{ .owned_string = allocator.dupe(u8, cursor_result) catch return CommandResult{ .error_msg = "ERR out of memory" } };
+
+    // cursor_result 可能是 allocPrint 分配的，需要释放
+    if (scan_result.next_key != null) {
+        allocator.free(cursor_result);
+    }
 
     const key_results = allocator.alloc(CommandResult, filtered.items.len) catch return CommandResult{ .error_msg = "ERR out of memory" };
     for (filtered.items, 0..) |k, idx| {
