@@ -11,10 +11,9 @@ const http_server = @import("http_server.zig");
 const config_mod = @import("config.zig");
 const tls = @import("tls");
 
-// --disable-dangerous 一键禁用的命令列表
+// flushdb/flushall 默认禁用，需 --enable-dangerous 显式启用
 const dangerous_commands = [_][]const u8{ "flushdb", "flushall" };
 
-// SIGTERM/SIGINT 全局标志，通知服务循环优雅退出
 var shutdown_requested: std.atomic.Value(bool) = .init(false);
 
 fn sigtermHandler(sig: std.os.linux.SIG) callconv(.c) void {
@@ -53,113 +52,30 @@ pub fn main(init: std.process.Init) !void {
         log.info("Loaded config from: {s}", .{path});
     }
 
-    // CLI 参数覆盖配置文件
+    // === CLI 参数（仅启动相关，其余走配置文件）===
     var host: [:0]const u8 = val(file_cfg, .host, "0.0.0.0");
     var port: u16 = valInt(file_cfg, .port, @as(u16, 6379));
     var data_path: [:0]const u8 = val(file_cfg, .data, "./data");
-    var log_level: ?[]const u8 = null;
-    var disable_dangerous = valBool(file_cfg, .disable_dangerous, false);
-    var disabled_commands_list: std.ArrayList([]const u8) = .empty;
-    var requirepass: ?[]const u8 = if (file_cfg) |c| c.requirepass else null;
-    var replicaof_host: ?[]const u8 = if (file_cfg) |c| @constCast(c.replicaof_host) else null;
-    var replicaof_port: ?u16 = if (file_cfg) |c| c.replicaof_port else null;
-    var masterauth: ?[]const u8 = if (file_cfg) |c| c.masterauth else null;
-    var tls_cert: ?[]const u8 = if (file_cfg) |c| c.tls_cert else null;
-    var tls_key: ?[]const u8 = if (file_cfg) |c| c.tls_key else null;
-    var tls_ca: ?[]const u8 = if (file_cfg) |c| c.tls_ca else null;
-    var tls_replica = valBool(file_cfg, .tls_replica, false);
-    var http_port: ?u16 = if (file_cfg) |c| c.http_port else null;
-    var http_secret: ?[]const u8 = if (file_cfg) |c| c.http_secret else null;
-    var http_sign_ttl: u64 = valInt(file_cfg, .http_sign_ttl, @as(u64, 3600));
-    const http_rate_burst: f64 = valFloat(file_cfg, .http_rate_burst, 30);
-    const http_rate_refill: f64 = valFloat(file_cfg, .http_rate_refill, 10);
+    var enable_http = false;
+    var enable_tls = false;
+    var enable_dangerous = false;
 
-    // 配置文件中的 disable_commands
-    if (file_cfg) |c| {
-        if (c.disable_commands) |cmds| {
-            var iter = std.mem.splitSequence(u8, cmds, ",");
-            while (iter.next()) |cmd| {
-                const trimmed = std.mem.trim(u8, cmd, " \t");
-                if (trimmed.len == 0) continue;
-                const lowered = std.ascii.allocLowerString(allocator, trimmed) catch continue;
-                disabled_commands_list.append(allocator, lowered) catch {
-                    allocator.free(lowered);
-                    continue;
-                };
-            }
-        }
-    }
-
-    defer {
-        for (disabled_commands_list.items) |cmd| allocator.free(cmd);
-        disabled_commands_list.deinit(allocator);
-    }
-
-    // CLI 参数覆盖配置文件
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--host") or std.mem.eql(u8, arg, "-H")) {
-            if (args.next()) |val_| host = val_;
+            if (args.next()) |v| host = v;
         } else if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
-            if (args.next()) |val_| port = std.fmt.parseInt(u16, val_, 10) catch {
-                log.err("Invalid port: {s}", .{val_});
+            if (args.next()) |v| port = std.fmt.parseInt(u16, v, 10) catch {
+                log.err("Invalid port: {s}", .{v});
                 return error.InvalidArgument;
             };
         } else if (std.mem.eql(u8, arg, "--data") or std.mem.eql(u8, arg, "-d")) {
-            if (args.next()) |val_| data_path = val_;
-        } else if (std.mem.eql(u8, arg, "--log-level") or std.mem.eql(u8, arg, "-l")) {
-            if (args.next()) |val_| log_level = val_;
-        } else if (std.mem.eql(u8, arg, "--disable-dangerous")) {
-            disable_dangerous = true;
-        } else if (std.mem.eql(u8, arg, "--disable-commands")) {
-            if (args.next()) |val_| {
-                var iter = std.mem.splitSequence(u8, val_, ",");
-                while (iter.next()) |cmd| {
-                    const trimmed = std.mem.trim(u8, cmd, " \t");
-                    if (trimmed.len == 0) continue;
-                    const lowered = std.ascii.allocLowerString(allocator, trimmed) catch continue;
-                    disabled_commands_list.append(allocator, lowered) catch {
-                        allocator.free(lowered);
-                        continue;
-                    };
-                }
-            }
-        } else if (std.mem.eql(u8, arg, "--requirepass") or std.mem.eql(u8, arg, "-a")) {
-            if (args.next()) |val_| requirepass = val_;
-        } else if (std.mem.eql(u8, arg, "--replicaof")) {
-            if (args.next()) |val_| {
-                replicaof_host = val_;
-                if (args.next()) |port_str| {
-                    replicaof_port = std.fmt.parseInt(u16, port_str, 10) catch {
-                        log.err("Invalid replicaof port: {s}", .{port_str});
-                        return error.InvalidArgument;
-                    };
-                } else {
-                    log.err("--replicaof requires <host> <port>", .{});
-                    return error.InvalidArgument;
-                }
-            }
-        } else if (std.mem.eql(u8, arg, "--masterauth")) {
-            if (args.next()) |val_| masterauth = val_;
-        } else if (std.mem.eql(u8, arg, "--tls-cert")) {
-            if (args.next()) |val_| tls_cert = val_;
-        } else if (std.mem.eql(u8, arg, "--tls-key")) {
-            if (args.next()) |val_| tls_key = val_;
-        } else if (std.mem.eql(u8, arg, "--tls-ca")) {
-            if (args.next()) |val_| tls_ca = val_;
-        } else if (std.mem.eql(u8, arg, "--tls-replica")) {
-            tls_replica = true;
-        } else if (std.mem.eql(u8, arg, "--http-port")) {
-            if (args.next()) |val_| http_port = std.fmt.parseInt(u16, val_, 10) catch {
-                log.err("Invalid HTTP port: {s}", .{val_});
-                return error.InvalidArgument;
-            };
-        } else if (std.mem.eql(u8, arg, "--http-secret")) {
-            if (args.next()) |val_| http_secret = val_;
-        } else if (std.mem.eql(u8, arg, "--http-sign-ttl")) {
-            if (args.next()) |val_| http_sign_ttl = std.fmt.parseInt(u64, val_, 10) catch {
-                log.err("Invalid HTTP sign TTL: {s}", .{val_});
-                return error.InvalidArgument;
-            };
+            if (args.next()) |v| data_path = v;
+        } else if (std.mem.eql(u8, arg, "--enable-http")) {
+            enable_http = true;
+        } else if (std.mem.eql(u8, arg, "--enable-tls")) {
+            enable_tls = true;
+        } else if (std.mem.eql(u8, arg, "--enable-dangerous")) {
+            enable_dangerous = true;
         } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
             _ = args.next(); // already handled above
         } else if (std.mem.eql(u8, arg, "--help")) {
@@ -168,37 +84,68 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // log-level 从配置文件或 CLI
-    if (log_level) |ll| {
-        const level = parseLogLevel(ll) orelse {
-            log.err("Invalid log level: {s}. Use: debug, info, warn, error", .{ll});
-            return error.InvalidArgument;
-        };
-        log.setLevel(level);
-    } else if (file_cfg) |c| {
-        if (c.log_level) |ll| {
-            if (parseLogLevel(ll)) |level| {
-                log.setLevel(level);
-            } else {
-                log.warn("Invalid log level in config: {s}", .{ll});
-            }
+    // === 从配置文件读取功能参数 ===
+    const log_level = if (file_cfg) |c| c.log_level else null;
+    const requirepass = if (file_cfg) |c| c.requirepass else null;
+    const replicaof_host = if (file_cfg) |c| @constCast(c.replicaof_host) else null;
+    const replicaof_port = if (file_cfg) |c| c.replicaof_port else null;
+    const masterauth = if (file_cfg) |c| c.masterauth else null;
+    const tls_cert = if (file_cfg) |c| c.tls_cert else null;
+    const tls_key = if (file_cfg) |c| c.tls_key else null;
+    const tls_ca = if (file_cfg) |c| c.tls_ca else null;
+    const tls_replica = valBool(file_cfg, .tls_replica, false);
+    const http_port = if (file_cfg) |c| c.http_port else null;
+    const http_secret = if (file_cfg) |c| c.http_secret else null;
+    const http_sign_ttl: u64 = valInt(file_cfg, .http_sign_ttl, @as(u64, 3600));
+    const http_rate_burst: f64 = valFloat(file_cfg, .http_rate_burst, 30);
+    const http_rate_refill: f64 = valFloat(file_cfg, .http_rate_refill, 10);
+
+    // 功能开关校验
+    if (enable_http and (http_port == null or http_secret == null)) {
+        log.err("--enable-http requires http-port and http-secret in config file", .{});
+        return error.InvalidArgument;
+    }
+    if (enable_tls and (tls_cert == null or tls_key == null)) {
+        log.err("--enable-tls requires tls-cert and tls-key in config file", .{});
+        return error.InvalidArgument;
+    }
+
+    // 禁用命令列表：默认禁用 dangerous_commands，--enable-dangerous 解除
+    var disabled_commands_list: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (disabled_commands_list.items) |cmd| allocator.free(cmd);
+        disabled_commands_list.deinit(allocator);
+    }
+
+    if (!enable_dangerous) {
+        for (&dangerous_commands) |cmd| {
+            const duped = allocator.dupe(u8, cmd) catch continue;
+            disabled_commands_list.append(allocator, duped) catch {
+                allocator.free(duped);
+                continue;
+            };
         }
     }
 
-    // --disable-dangerous 将 flushdb/flushall 追加到禁用列表（去重）
-    if (disable_dangerous) {
-        for (&dangerous_commands) |cmd| {
-            var found = false;
-            for (disabled_commands_list.items) |existing| {
-                if (std.mem.eql(u8, existing, cmd)) {
-                    found = true;
-                    break;
+    // 配置文件中的 disable_commands 追加
+    if (file_cfg) |c| {
+        if (c.disable_commands) |cmds| {
+            var iter = std.mem.splitSequence(u8, cmds, ",");
+            while (iter.next()) |cmd| {
+                const trimmed = std.mem.trim(u8, cmd, " \t");
+                if (trimmed.len == 0) continue;
+                // 去重
+                var found = false;
+                for (disabled_commands_list.items) |existing| {
+                    if (std.mem.eql(u8, existing, trimmed)) {
+                        found = true;
+                        break;
+                    }
                 }
-            }
-            if (!found) {
-                const duped = allocator.dupe(u8, cmd) catch continue;
-                disabled_commands_list.append(allocator, duped) catch {
-                    allocator.free(duped);
+                if (found) continue;
+                const lowered = std.ascii.allocLowerString(allocator, trimmed) catch continue;
+                disabled_commands_list.append(allocator, lowered) catch {
+                    allocator.free(lowered);
                     continue;
                 };
             }
@@ -212,19 +159,28 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // log-level
+    if (log_level) |ll| {
+        if (parseLogLevel(ll)) |level| {
+            log.setLevel(level);
+        } else {
+            log.warn("Invalid log level in config: {s}", .{ll});
+        }
+    }
+
     log.info("Starting NovelKV on {s}:{d}", .{ host, port });
     log.info("Data directory: {s}", .{data_path});
     if (requirepass) |_| log.info("Authentication required", .{});
+    if (enable_dangerous) log.info("Dangerous commands ENABLED (flushdb, flushall)", .{});
 
     // TLS 初始化
     var tls_auth: ?tls.config.CertKeyPair = null;
     defer {
         if (tls_auth) |*a| a.deinit(allocator);
     }
-
     var tls_cfg: ?storage.TlsConfig = null;
 
-    if (tls_cert != null and tls_key != null) {
+    if (enable_tls) {
         tls_auth = tls.config.CertKeyPair.fromFilePathAbsolute(allocator, io, tls_cert.?, tls_key.?) catch |err| {
             log.err("Failed to load TLS certificate: {}", .{err});
             return err;
@@ -236,22 +192,9 @@ pub fn main(init: std.process.Init) !void {
             .ca_file = tls_ca,
             .replica_tls = tls_replica,
         };
-    } else if (tls_cert != null or tls_key != null) {
-        log.err("Both --tls-cert and --tls-key are required for TLS", .{});
-        return error.InvalidArgument;
     }
 
-    // HTTP 接口校验
-    if (http_port != null and http_secret == null) {
-        log.err("--http-secret is required when --http-port is set", .{});
-        return error.InvalidArgument;
-    }
-    if (http_secret != null and http_port == null) {
-        log.err("--http-port is required when --http-secret is set", .{});
-        return error.InvalidArgument;
-    }
-
-    // 构建存储配置（配置文件中的 storage 参数覆盖）
+    // 构建存储配置
     var db_config = storage.DbConfig{};
     if (file_cfg) |c| {
         if (c.write_buffer_size) |v| db_config.write_buffer_size = v;
@@ -273,7 +216,6 @@ pub fn main(init: std.process.Init) !void {
     };
     defer db.close();
 
-    // 数据库打开后设置 TLS 状态
     if (tls_auth) |auth| {
         db.tls_auth = auth;
         db.tls_config = tls_cfg;
@@ -291,7 +233,6 @@ pub fn main(init: std.process.Init) !void {
         };
         log.info("Replica mode: replicating from {s}:{d}", .{ master_host, master_port });
     } else {
-        // 主节点：初始化 MasterState
         const master_state = allocator.create(replication.MasterState) catch {
             log.err("Failed to initialize replication state", .{});
             return error.OutOfMemory;
@@ -318,16 +259,15 @@ pub fn main(init: std.process.Init) !void {
         return error.StartupFailed;
     };
 
-    if (http_port) |hp| {
+    if (enable_http) {
         const http_cfg = http_server.HttpConfig{
-            .port = hp,
+            .port = http_port.?,
             .secret = http_secret.?,
             .sign_ttl = http_sign_ttl,
             .host = host,
             .rate_limit_burst = http_rate_burst,
             .rate_limit_refill = http_rate_refill,
         };
-        log.info("HTTP chapter API enabled: {s}:{d} (sign TTL: {d}s, burst: {d:.0}, refill: {d:.0}/s)", .{ host, hp, http_sign_ttl, http_rate_burst, http_rate_refill });
         group.concurrent(io, http_server.serve, .{
             io, allocator, &db, http_cfg, &shutdown_requested,
         }) catch {
@@ -336,11 +276,9 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    // 阻塞等待所有服务退出
     group.await(io) catch {};
 }
 
-/// RESP 服务协程入口，包装 server.serve 使其返回 Cancelable!void
 fn serveResp(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, host: []const u8, port: u16, shutdown_flag: *std.atomic.Value(bool)) std.Io.Cancelable!void {
     server.serve(io, allocator, db, host, port, shutdown_flag) catch |e| {
         if (!shutdown_flag.load(.acquire)) {
@@ -349,11 +287,9 @@ fn serveResp(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, ho
     };
 }
 
-// 配置值辅助函数：从 file_cfg 读取字段，null 时返回默认值
 fn val(c: ?config_mod.Config, comptime field: std.meta.FieldEnum(config_mod.Config), default: [:0]const u8) [:0]const u8 {
     if (c) |cfg| {
         if (@field(cfg, @tagName(field))) |v| {
-            // 配置文件中的 []const u8 可以安全转为 [:0]const u8（它们以 null 结尾分配）
             const ptr: [*]const u8 = v.ptr;
             return ptr[0..v.len :0];
         }
@@ -389,43 +325,21 @@ fn printUsage() void {
         \\Usage: novelkv [OPTIONS]
         \\
         \\Options:
-        \\  -c, --config <PATH>        Load configuration file (Redis conf style)
+        \\  -c, --config <PATH>        Load configuration file (required for most features)
         \\  -H, --host <HOST>          Listen address (default: 0.0.0.0)
         \\  -p, --port <PORT>          Listen port (default: 6379)
         \\  -d, --data <PATH>          Data directory (default: ./data)
-        \\  -l, --log-level <LEVEL>    Log level: debug, info, warn, error (default: info)
-        \\  --disable-dangerous        Disable dangerous commands (flushdb, flushall)
-        \\  --disable-commands <LIST>  Comma-separated list of commands to disable
-        \\  -a, --requirepass <PASS>   Require client authentication
-        \\  --replicaof <HOST> <PORT>  Replicate from master (replica mode)
-        \\  --masterauth <PASS>        Master authentication password
-        \\  --tls-cert <PATH>          TLS certificate file (enables TLS)
-        \\  --tls-key <PATH>           TLS private key file (required with --tls-cert)
-        \\  --tls-ca <PATH>            CA certificate for client/replica verification
-        \\  --tls-replica              Use TLS for replica-to-master connection
-        \\  --http-port <PORT>         Enable HTTP chapter API on this port
-        \\  --http-secret <SECRET>     HMAC-SHA256 secret key (required with --http-port)
-        \\  --http-sign-ttl <SECONDS>  Signed URL TTL in seconds (default: 3600)
+        \\  --enable-http              Enable HTTP chapter API (requires http-port/secret in config)
+        \\  --enable-tls               Enable TLS encryption (requires tls-cert/key in config)
+        \\  --enable-dangerous         Enable dangerous commands (flushdb, flushall, disabled by default)
         \\  --help                     Show this help
         \\
-        \\Config file format (Redis conf style, # for comments):
-        \\  host 0.0.0.0
-        \\  port 6379
-        \\  data ./data
-        \\  log-level info
-        \\  requirepass mysecret
-        \\  disable-dangerous yes
-        \\  http-port 8080
-        \\  http-secret mysecret
-        \\  http-sign-ttl 3600
-        \\  http-rate-burst 30
-        \\  http-rate-refill 10
-        \\  write-buffer-size 64mb
-        \\  block-size 128kb
-        \\  compression-level 9
-        \\  bloom-bits 10
-        \\
-        \\CLI arguments override config file values.
+        \\All tuning parameters are set via config file:
+        \\  host, port, data, log-level, requirepass
+        \\  tls-cert, tls-key, tls-ca, tls-replica
+        \\  replicaof, masterauth
+        \\  http-port, http-secret, http-sign-ttl, http-rate-burst, http-rate-refill
+        \\  write-buffer-size, block-size, compression-level, bloom-bits
         \\
     , .{});
 }
