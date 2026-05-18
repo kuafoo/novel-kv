@@ -638,7 +638,7 @@ fn cmdInfo(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
         const section = getStringArg(args, 1) orelse "";
         if (std.mem.eql(u8, section, "server")) {
             const info = std.fmt.allocPrint(allocator,
-                "# Server\r\nnovelkv_version:1.1.0\r\nengine:rocksdb+Zstd+bloom\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\nuptime_in_seconds:{d}\r\ntls_enabled:{s}\r\n",
+                "# Server\r\nnovelkv_version:1.2.0\r\nengine:rocksdb+Zstd+bloom\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\nuptime_in_seconds:{d}\r\ntls_enabled:{s}\r\n",
                 .{ client.port, pid, uptime, tls_status },
             ) catch return CommandResult{ .error_msg = "ERR out of memory" };
             return CommandResult{ .owned_string = info };
@@ -696,7 +696,7 @@ fn cmdInfo(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
     defer allocator.free(ks);
 
     const info = std.fmt.allocPrint(allocator,
-        "# Server\r\nnovelkv_version:1.1.0\r\nengine:rocksdb+Zstd+bloom\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\nuptime_in_seconds:{d}\r\ntls_enabled:{s}\r\n" ++
+        "# Server\r\nnovelkv_version:1.2.0\r\nengine:rocksdb+Zstd+bloom\r\nos:Linux\r\narch_bits:64\r\ntcp_port:{d}\r\nprocess_id:{d}\r\nuptime_in_seconds:{d}\r\ntls_enabled:{s}\r\n" ++
         "\r\n# Clients\r\nconnected_clients:{d}\r\ntotal_connections_received:{d}\r\n" ++
         "\r\n# Memory\r\nused_memory_rss_kb:{d}\r\nused_memory_vm_kb:{d}\r\n" ++
         "\r\n# Stats\r\ntotal_commands_processed:{d}\r\ntotal_reads:{d}\r\ntotal_writes:{d}\r\ndb{d}_keys:{d}\r\ndb{d}_sst_files:{d}\r\ndb{d}_sst_size_bytes:{d}\r\nblock_cache_usage:{d}\r\nblock_cache_capacity:{d}\r\n" ++

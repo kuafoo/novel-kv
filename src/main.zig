@@ -7,6 +7,7 @@ const command = @import("command.zig");
 const storage = @import("storage.zig");
 const replication = @import("replication.zig");
 const log = @import("log.zig");
+const http_server = @import("http_server.zig");
 const tls = @import("tls");
 
 // --disable-dangerous 一键禁用的命令列表
@@ -40,6 +41,9 @@ pub fn main(init: std.process.Init) !void {
     var tls_key: ?[]const u8 = null;
     var tls_ca: ?[]const u8 = null;
     var tls_replica = false;
+    var http_port: ?u16 = null;
+    var http_secret: ?[]const u8 = null;
+    var http_sign_ttl: u64 = 3600;
     defer {
         for (disabled_commands_list.items) |cmd| allocator.free(cmd);
         disabled_commands_list.deinit(allocator);
@@ -119,6 +123,24 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--tls-replica")) {
             tls_replica = true;
+        } else if (std.mem.eql(u8, arg, "--http-port")) {
+            if (args.next()) |val| {
+                http_port = std.fmt.parseInt(u16, val, 10) catch {
+                    log.err("Invalid HTTP port: {s}", .{val});
+                    return error.InvalidArgument;
+                };
+            }
+        } else if (std.mem.eql(u8, arg, "--http-secret")) {
+            if (args.next()) |val| {
+                http_secret = val;
+            }
+        } else if (std.mem.eql(u8, arg, "--http-sign-ttl")) {
+            if (args.next()) |val| {
+                http_sign_ttl = std.fmt.parseInt(u64, val, 10) catch {
+                    log.err("Invalid HTTP sign TTL: {s}", .{val});
+                    return error.InvalidArgument;
+                };
+            }
         } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return;
@@ -181,6 +203,16 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArgument;
     }
 
+    // HTTP 接口校验
+    if (http_port != null and http_secret == null) {
+        log.err("--http-secret is required when --http-port is set", .{});
+        return error.InvalidArgument;
+    }
+    if (http_secret != null and http_port == null) {
+        log.err("--http-port is required when --http-secret is set", .{});
+        return error.InvalidArgument;
+    }
+
     var db = storage.Database.open(allocator, .{
         .path = data_path,
         .disabled_commands = disabled_commands_list.items,
@@ -228,12 +260,40 @@ pub fn main(init: std.process.Init) !void {
     _ = std.os.linux.sigaction(std.os.linux.SIG.TERM, &sigterm_action, null);
     _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sigterm_action, null);
 
-    server.serve(io, allocator, &db, host, port, &shutdown_requested) catch |e| {
-        if (shutdown_requested.load(.acquire)) {
-            log.info("Shutting down gracefully...", .{});
-        } else {
-            log.err("Server error: {}", .{e});
-            return e;
+    var group: std.Io.Group = .init;
+
+    group.concurrent(io, serveResp, .{
+        io, allocator, &db, host, port, &shutdown_requested,
+    }) catch {
+        log.err("Failed to start RESP server", .{});
+        return error.StartupFailed;
+    };
+
+    if (http_port) |hp| {
+        const http_cfg = http_server.HttpConfig{
+            .port = hp,
+            .secret = http_secret.?,
+            .sign_ttl = http_sign_ttl,
+            .host = host,
+        };
+        log.info("HTTP chapter API enabled: {s}:{d} (sign TTL: {d}s)", .{ host, hp, http_sign_ttl });
+        group.concurrent(io, http_server.serve, .{
+            io, allocator, &db, http_cfg, &shutdown_requested,
+        }) catch {
+            log.err("Failed to start HTTP server", .{});
+            return error.StartupFailed;
+        };
+    }
+
+    // 阻塞等待所有服务退出
+    group.await(io) catch {};
+}
+
+/// RESP 服务协程入口，包装 server.serve 使其返回 Cancelable!void
+fn serveResp(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, host: []const u8, port: u16, shutdown_flag: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+    server.serve(io, allocator, db, host, port, shutdown_flag) catch |e| {
+        if (!shutdown_flag.load(.acquire)) {
+            log.err("RESP server error: {}", .{e});
         }
     };
 }
@@ -258,6 +318,9 @@ fn printUsage() void {
         \\  --tls-key <PATH>           TLS private key file (required with --tls-cert)
         \\  --tls-ca <PATH>            CA certificate for client/replica verification
         \\  --tls-replica              Use TLS for replica-to-master connection
+        \\  --http-port <PORT>         Enable HTTP chapter API on this port
+        \\  --http-secret <SECRET>     HMAC-SHA256 secret key (required with --http-port)
+        \\  --http-sign-ttl <SECONDS>  Signed URL TTL in seconds (default: 3600)
         \\  --help                     Show this help
         \\
         \\Examples:
@@ -283,4 +346,5 @@ test {
     _ = resp;
     _ = command;
     _ = storage;
+    _ = http_server;
 }
