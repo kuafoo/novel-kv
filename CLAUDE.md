@@ -18,6 +18,7 @@
 - `src/tls_adapter.zig` — TLS 适配器，桥接 tls.Connection 到 std.Io.Reader/Writer
 - `crawl_novels.py` — 小说爬虫，为压缩基准测试提供真实文本数据
 - `src/compress_bench.zig` — 压缩基准测试工具
+- `src/http_server.zig` — HTTP 只读章节接口（签名 URL 验证 + 限流 + CORS）
 
 ## Design Decisions
 
@@ -30,6 +31,7 @@
 - 主从复制：`--replicaof <host> <port>` 启动副本模式，最终一致性
 - TLS 加密：`--tls-cert/--tls-key` 启用 TLS 1.3，`--tls-replica` 副本 TLS 连接
 - 危险命令（flushdb/flushall）可禁用
+- HTTP 只读章节接口：`/chapter/{key}?sign=xxx&t=timestamp`，HMAC-SHA256 签名 URL 防遍历和未授权调用，令牌桶限流
 
 ## Supported Commands
 
@@ -42,6 +44,7 @@
 | 备份 | SAVE, BGSAVE |
 | 连接 | PING, ECHO, QUIT, AUTH, COMMAND, CONFIG, INFO |
 | 复制 | REPLCONF, PSYNC |
+| HTTP | GET /chapter/{key}?sign=xxx&t=timestamp (只读，签名验证) |
 
 ## Build & Test
 
