@@ -640,8 +640,7 @@ pub const Database = struct {
             rocksdb.rocksdb_iter_seek_to_first(iter);
         }
 
-        const cap: usize = if (limit == 0) 256 else @min(limit, 256);
-        var keys = std.ArrayList([]const u8).initCapacity(allocator, cap) catch
+        var keys = std.ArrayList([]const u8).initCapacity(allocator, if (limit == 0) 256 else @min(limit, 256)) catch
             return &.{};
 
         while (rocksdb.rocksdb_iter_valid(iter) != 0 and (limit == 0 or keys.items.len < limit)) {
@@ -656,7 +655,10 @@ pub const Database = struct {
             }
 
             const duped = allocator.dupe(u8, key[0..key_len]) catch break;
-            keys.appendAssumeCapacity(duped);
+            keys.append(allocator, duped) catch {
+                allocator.free(duped);
+                break;
+            };
             rocksdb.rocksdb_iter_next(iter);
         }
 
@@ -675,8 +677,7 @@ pub const Database = struct {
             rocksdb.rocksdb_iter_seek_to_first(iter);
         }
 
-        const cap: usize = if (limit == 0) 256 else @min(limit, 256);
-        var items = std.ArrayList(KeyValue).initCapacity(allocator, cap) catch
+        var items = std.ArrayList(KeyValue).initCapacity(allocator, if (limit == 0) 256 else @min(limit, 256)) catch
             return &.{};
 
         while (rocksdb.rocksdb_iter_valid(iter) != 0 and (limit == 0 or items.items.len < limit)) {
@@ -697,7 +698,11 @@ pub const Database = struct {
                 allocator.free(duped_key);
                 break;
             };
-            items.appendAssumeCapacity(.{ .key = duped_key, .value = duped_val });
+            items.append(allocator, .{ .key = duped_key, .value = duped_val }) catch {
+                allocator.free(duped_key);
+                allocator.free(duped_val);
+                break;
+            };
             rocksdb.rocksdb_iter_next(iter);
         }
 
@@ -730,7 +735,10 @@ pub const Database = struct {
             if (key_len == 0) break;
 
             const duped = allocator.dupe(u8, key[0..key_len]) catch break;
-            keys.appendAssumeCapacity(duped);
+            keys.append(allocator, duped) catch {
+                allocator.free(duped);
+                break;
+            };
             rocksdb.rocksdb_iter_next(iter);
         }
 
