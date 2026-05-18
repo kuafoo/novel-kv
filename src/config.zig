@@ -38,6 +38,21 @@ pub const Config = struct {
     block_size: ?usize = null,
     compression_level: ?c_int = null,
     bloom_bits_per_key: ?f64 = null,
+
+    pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        const fields = .{
+            "host",           "data",         "log_level",
+            "requirepass",    "disable_commands",
+            "tls_cert",       "tls_key",      "tls_ca",
+            "replicaof_host", "masterauth",    "http_secret",
+        };
+        inline for (fields) |field_name| {
+            if (@field(self, field_name)) |v| {
+                // dupeZ allocates len+1 (with sentinel), free the full allocation
+                allocator.free(v.ptr[0 .. v.len + 1]);
+            }
+        }
+    }
 };
 
 /// 从文件解析配置，返回带默认值填充的 Config。

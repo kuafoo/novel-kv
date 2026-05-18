@@ -347,6 +347,7 @@ pub const Database = struct {
     }
 
     pub fn close(self: *Database) void {
+        rocksdb.rocksdb_close(self.db);
         for (&self.cf_handles) |*handle| {
             rocksdb.rocksdb_column_family_handle_destroy(handle.*);
         }
@@ -354,7 +355,6 @@ pub const Database = struct {
         rocksdb.rocksdb_writeoptions_destroy(self.write_options);
         if (self.filter_policy) |fp| rocksdb.rocksdb_filterpolicy_destroy(fp);
         if (self.block_cache) |bc| rocksdb.rocksdb_cache_destroy(bc);
-        rocksdb.rocksdb_close(self.db);
         log.info("Database closed", .{});
     }
 

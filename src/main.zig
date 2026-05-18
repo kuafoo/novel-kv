@@ -37,6 +37,9 @@ pub fn main(init: std.process.Init) !void {
                 return e;
             };
             return;
+        } else if (std.mem.eql(u8, first_arg, "gen-secret")) {
+            runGenSecret(io, allocator, args);
+            return;
         }
     }
 
@@ -59,6 +62,9 @@ pub fn main(init: std.process.Init) !void {
 
     // 加载配置文件（可选）
     var file_cfg: ?config_mod.Config = null;
+    defer {
+        if (file_cfg) |*c| c.deinit(allocator);
+    }
     if (config_path) |path| {
         const cfg = config_mod.parseFromFile(io, allocator, path) catch {
             log.err("Failed to load config file: {s}", .{path});
@@ -453,4 +459,53 @@ fn runGenCerts(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args.
 
     log.info("Certificate written to {s}", .{cert_path});
     log.info("Private key written to {s} (mode 600)", .{key_path});
+}
+
+// === gen-secret 子命令 ===
+
+fn runGenSecret(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args.Iterator) void {
+    _ = allocator;
+    var byte_count: usize = 32;
+
+    var iter = args;
+    while (iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--bytes") or std.mem.eql(u8, arg, "-b")) {
+            if (iter.next()) |v| {
+                byte_count = std.fmt.parseInt(usize, v, 10) catch {
+                    log.err("Invalid bytes: {s}", .{v});
+                    return;
+                };
+            }
+        } else if (std.mem.eql(u8, arg, "--help")) {
+            std.debug.print(
+                \\Usage: novelkv gen-secret [OPTIONS]
+                \\
+                \\Generate a random hex-encoded secret key for HMAC-SHA256 signing.
+                \\Use as http-secret in the config file.
+                \\
+                \\Options:
+                \\  -b, --bytes <N>  Random bytes (default: 32, produces 64-char hex string)
+                \\
+            , .{});
+            return;
+        }
+    }
+
+    var random_bytes: [64]u8 = undefined;
+    if (byte_count > random_bytes.len) {
+        log.err("Max --bytes is {d}", .{random_bytes.len});
+        return;
+    }
+    const bytes = random_bytes[0..byte_count];
+    io.random(bytes);
+
+    // 手动转 hex
+    const hex_chars = "0123456789abcdef";
+    var hex_buf: [128]u8 = undefined;
+    for (bytes, 0..) |b, i| {
+        hex_buf[i * 2] = hex_chars[b >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[b & 0x0F];
+    }
+
+    std.debug.print("{s}\n", .{hex_buf[0 .. byte_count * 2]});
 }
