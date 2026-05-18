@@ -9,6 +9,7 @@ const replication = @import("replication.zig");
 const log = @import("log.zig");
 const http_server = @import("http_server.zig");
 const config_mod = @import("config.zig");
+const gen_certs = @import("gen_certs.zig");
 const tls = @import("tls");
 
 // flushdb/flushall 默认禁用，需 --enable-dangerous 显式启用
@@ -26,6 +27,21 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args.skip();
+
+    // 检测 gen-certs 子命令
+    if (args.next()) |first_arg| {
+        if (std.mem.eql(u8, first_arg, "gen-certs")) {
+            runGenCerts(io, allocator, args) catch |e| {
+                log.err("gen-certs failed: {}", .{e});
+                return e;
+            };
+            return;
+        }
+    }
+
+    // 重新初始化 args 迭代器（gen-certs 没匹配时重新遍历）
+    args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
 
     // 先扫描 --config 参数，优先加载配置文件
@@ -358,4 +374,83 @@ test {
     _ = storage;
     _ = http_server;
     _ = config_mod;
+    _ = gen_certs;
+}
+
+// === gen-certs 子命令 ===
+
+fn runGenCerts(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args.Iterator) !void {
+    var output_dir: []const u8 = ".";
+    var common_name: []const u8 = "novelkv";
+    var days: u32 = 365;
+
+    var iter = args;
+    while (iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--output-dir") or std.mem.eql(u8, arg, "-o")) {
+            if (iter.next()) |v| output_dir = v;
+        } else if (std.mem.eql(u8, arg, "--cn")) {
+            if (iter.next()) |v| common_name = v;
+        } else if (std.mem.eql(u8, arg, "--days")) {
+            if (iter.next()) |v| {
+                days = std.fmt.parseInt(u32, v, 10) catch {
+                    log.err("Invalid days: {s}", .{v});
+                    return error.InvalidArgument;
+                };
+            }
+        } else if (std.mem.eql(u8, arg, "--help")) {
+            std.debug.print(
+                \\Usage: novelkv gen-certs [OPTIONS]
+                \\
+                \\Generate self-signed ECDSA P-256 TLS certificate.
+                \\
+                \\Options:
+                \\  -o, --output-dir <DIR>  Output directory (default: current)
+                \\  --cn <NAME>             Common name (default: novelkv)
+                \\  --days <N>              Validity in days (default: 365)
+                \\
+            , .{});
+            return;
+        }
+    }
+
+    log.info("Generating self-signed certificate (CN={s}, {d} days)", .{ common_name, days });
+
+    const result = try gen_certs.generateCert(io, allocator, common_name, days);
+
+    // 写入文件
+    const cert_path = try std.fs.path.join(allocator, &.{ output_dir, "cert.pem" });
+    defer allocator.free(cert_path);
+    const key_path = try std.fs.path.join(allocator, &.{ output_dir, "key.pem" });
+    defer allocator.free(key_path);
+
+    const cert_file = std.Io.Dir.cwd().createFile(io, cert_path, .{}) catch |err| {
+        log.err("Failed to create {s}: {}", .{ cert_path, err });
+        return err;
+    };
+    defer cert_file.close(io);
+    cert_file.writeStreamingAll(io, result.cert_pem) catch |err| {
+        log.err("Failed to write {s}: {}", .{ cert_path, err });
+        return err;
+    };
+
+    const key_file = std.Io.Dir.cwd().createFile(io, key_path, .{}) catch |err| {
+        log.err("Failed to create {s}: {}", .{ key_path, err });
+        return err;
+    };
+    defer key_file.close(io);
+    key_file.writeStreamingAll(io, result.key_pem) catch |err| {
+        log.err("Failed to write {s}: {}", .{ key_path, err });
+        return err;
+    };
+
+    // 设置私钥文件权限为 600
+    const key_path_z = try allocator.dupeZ(u8, key_path);
+    defer allocator.free(key_path_z);
+    _ = std.os.linux.chmod(key_path_z.ptr, 0o600);
+
+    allocator.free(result.cert_pem);
+    allocator.free(result.key_pem);
+
+    log.info("Certificate written to {s}", .{cert_path});
+    log.info("Private key written to {s} (mode 600)", .{key_path});
 }
