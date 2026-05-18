@@ -98,6 +98,12 @@ else
 fi
 chmod 600 "$CONFIG_DIR/novelkv.conf"
 
+if [[ ! -f "$CONFIG_DIR/novelkv.env" ]]; then
+    cp "$SCRIPT_DIR/novelkv.env" "$CONFIG_DIR/novelkv.env"
+    echo "  Installed $CONFIG_DIR/novelkv.env"
+fi
+chmod 644 "$CONFIG_DIR/novelkv.env"
+
 echo "[5/7] Installing systemd service..."
 sed "s|__BIN_PATH__|$BIN_DIR/$BIN_NAME|g" \
     "$SCRIPT_DIR/novelkv.service" > /etc/systemd/system/novelkv.service

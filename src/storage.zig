@@ -32,6 +32,17 @@ pub const Config = struct {
     bloom_bits_per_key: f64 = 10.0,
     /// TLS 配置（非 null 表示启用 TLS）
     tls_config: ?TlsConfig = null,
+    /// 配置文件覆盖的存储参数（可选）
+    db_config: DbConfig = .{},
+};
+
+/// 配置文件可覆盖的存储引擎参数
+pub const DbConfig = struct {
+    write_buffer_size: ?usize = null,
+    max_write_buffer_number: ?c_int = null,
+    block_size: ?usize = null,
+    compression_level: ?c_int = null,
+    bloom_bits_per_key: ?f64 = null,
 };
 
 pub const TlsConfig = struct {
@@ -78,6 +89,13 @@ pub const Database = struct {
     pub fn open(allocator: std.mem.Allocator, config: Config) !Database {
         var err: [*c]u8 = null;
 
+        // 配置文件覆盖存储参数
+        const comp_level = config.db_config.compression_level orelse config.compression_level;
+        const blk_size = config.db_config.block_size orelse config.block_size;
+        const wb_size = config.db_config.write_buffer_size orelse config.write_buffer_size;
+        const wb_num = config.db_config.max_write_buffer_number orelse config.max_write_buffer_number;
+        const bloom_bits = config.db_config.bloom_bits_per_key orelse config.bloom_bits_per_key;
+
         const options = rocksdb.rocksdb_options_create();
         defer rocksdb.rocksdb_options_destroy(options);
 
@@ -85,17 +103,17 @@ pub const Database = struct {
 
         // ---- 压缩配置：Zstd 字典压缩，针对小说文本优化压缩比 ----
         rocksdb.rocksdb_options_set_compression(options, 7); // 7 = kZSTD
-        rocksdb.rocksdb_options_set_compression_options(options, 0, config.compression_level, 0, config.dict_size);
+        rocksdb.rocksdb_options_set_compression_options(options, 0, comp_level, 0, config.dict_size);
         rocksdb.rocksdb_options_set_compression_options_zstd_max_train_bytes(options, config.zstd_train_bytes);
         rocksdb.rocksdb_options_set_compression_options_use_zstd_dict_trainer(options, 1);
 
         // ---- Block-Based Table 配置：Bloom Filter + Block Cache ----
         const block_opts = rocksdb.rocksdb_block_based_options_create();
         defer rocksdb.rocksdb_block_based_options_destroy(block_opts);
-        rocksdb.rocksdb_block_based_options_set_block_size(block_opts, config.block_size);
+        rocksdb.rocksdb_block_based_options_set_block_size(block_opts, blk_size);
 
         // Bloom Filter：减少不存在的 key 的磁盘 I/O
-        const filter_policy = rocksdb.rocksdb_filterpolicy_create_bloom(config.bloom_bits_per_key);
+        const filter_policy = rocksdb.rocksdb_filterpolicy_create_bloom(bloom_bits);
         rocksdb.rocksdb_block_based_options_set_filter_policy(block_opts, filter_policy);
 
         // LRU Block Cache：缓存热数据 block，避免重复磁盘读取
@@ -109,8 +127,8 @@ pub const Database = struct {
         rocksdb.rocksdb_options_set_block_based_table_factory(options, block_opts);
 
         // ---- Write Buffer 配置 ----
-        rocksdb.rocksdb_options_set_write_buffer_size(options, config.write_buffer_size);
-        rocksdb.rocksdb_options_set_max_write_buffer_number(options, config.max_write_buffer_number);
+        rocksdb.rocksdb_options_set_write_buffer_size(options, wb_size);
+        rocksdb.rocksdb_options_set_max_write_buffer_number(options, wb_num);
 
         // ---- Compaction 调优（写一次读多次的小说存储场景）----
         rocksdb.rocksdb_options_set_max_background_jobs(options, 4);

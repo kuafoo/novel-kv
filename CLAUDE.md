@@ -19,6 +19,7 @@
 - `crawl_novels.py` — 小说爬虫，为压缩基准测试提供真实文本数据
 - `src/compress_bench.zig` — 压缩基准测试工具
 - `src/http_server.zig` — HTTP 只读章节接口（签名 URL 验证 + 限流 + CORS）
+- `src/config.zig` — Redis conf 风格配置文件解析器
 
 ## Design Decisions
 
@@ -32,6 +33,7 @@
 - TLS 加密：`--tls-cert/--tls-key` 启用 TLS 1.3，`--tls-replica` 副本 TLS 连接
 - 危险命令（flushdb/flushall）可禁用
 - HTTP 只读章节接口：`/chapter/{key}?sign=xxx&t=timestamp`，HMAC-SHA256 签名 URL 防遍历和未授权调用，令牌桶限流
+- Redis conf 风格配置文件：`--config path` 加载，CLI 参数可覆盖配置文件值。限流、存储引擎参数等放在配置文件
 
 ## Supported Commands
 

@@ -8,8 +8,8 @@ Type=simple
 User=novelkv
 Group=novelkv
 
-ExecStart=__BIN_PATH__ $NOVELKV_OPTS
-EnvironmentFile=-/etc/novelkv/novelkv.conf
+ExecStart=__BIN_PATH__ --config /etc/novelkv/novelkv.conf $NOVELKV_OPTS
+EnvironmentFile=-/etc/novelkv/novelkv.env
 
 WorkingDirectory=/var/lib/novelkv
 

@@ -10,6 +10,8 @@ pub const HttpConfig = struct {
     secret: []const u8,
     sign_ttl: u64 = 3600,
     host: []const u8 = "0.0.0.0",
+    rate_limit_burst: f64 = 30,
+    rate_limit_refill: f64 = 10,
 };
 
 // ============================================================
@@ -22,10 +24,10 @@ const RateLimiter = struct {
         last_refill_ms: i64,
     };
 
-    const max_tokens: f64 = 30;
-    const refill_per_sec: f64 = 10;
     const idle_cleanup_ms: i64 = 60_000;
 
+    max_tokens: f64,
+    refill_per_sec: f64,
     buckets: std.HashMap([46]u8, Bucket, ArrayHashContext, std.hash_map.default_max_load_percentage),
 
     const ArrayHashContext = struct {
@@ -39,8 +41,10 @@ const RateLimiter = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator) RateLimiter {
+    pub fn init(allocator: std.mem.Allocator, burst: f64, refill: f64) RateLimiter {
         return .{
+            .max_tokens = burst,
+            .refill_per_sec = refill,
             .buckets = std.HashMap([46]u8, Bucket, ArrayHashContext, std.hash_map.default_max_load_percentage).init(allocator),
         };
     }
@@ -54,8 +58,8 @@ const RateLimiter = struct {
         if (self.buckets.getPtr(ip)) |bucket| {
             const elapsed_ms = now_ms - bucket.last_refill_ms;
             if (elapsed_ms > 0) {
-                const refill = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0 * refill_per_sec;
-                bucket.tokens = @min(bucket.tokens + refill, max_tokens);
+                const refill = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0 * self.refill_per_sec;
+                bucket.tokens = @min(bucket.tokens + refill, self.max_tokens);
                 bucket.last_refill_ms = now_ms;
             }
             if (bucket.tokens >= 1.0) {
@@ -67,7 +71,7 @@ const RateLimiter = struct {
         const entry = self.buckets.getOrPut(ip) catch return true;
         if (entry.found_existing) return true;
         entry.value_ptr.* = .{
-            .tokens = max_tokens - 1.0,
+            .tokens = self.max_tokens - 1.0,
             .last_refill_ms = now_ms,
         };
         return true;
@@ -103,9 +107,9 @@ pub fn serve(io: std.Io, allocator: std.mem.Allocator, db: *storage.Database, co
     };
     defer tcp_server.deinit(io);
 
-    log.info("HTTP chapter API on {s}:{d} (sign TTL: {d}s)", .{ config.host, config.port, config.sign_ttl });
+    log.info("HTTP chapter API on {s}:{d} (sign TTL: {d}s, burst: {d:.0}, refill: {d:.0}/s)", .{ config.host, config.port, config.sign_ttl, config.rate_limit_burst, config.rate_limit_refill });
 
-    var rate_limiter = RateLimiter.init(allocator);
+    var rate_limiter = RateLimiter.init(allocator, config.rate_limit_burst, config.rate_limit_refill);
     defer rate_limiter.deinit();
 
     var group: std.Io.Group = .init;
