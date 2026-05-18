@@ -8,18 +8,16 @@
 
 ## Architecture
 
-- `src/main.zig` — CLI 入口，参数解析，信号处理
+- `src/main.zig` — CLI 入口，功能开关，信号处理
+- `src/config.zig` — Redis conf 风格配置文件解析器
 - `src/server.zig` — TCP 服务，RESP 协议解析，连接管理
 - `src/command.zig` — 命令分发与处理（仅文本存储必要命令）
 - `src/storage.zig` — RocksDB 封装，Column Family 管理，RwLock 并发
 - `src/resp.zig` — RESP 协议写入
 - `src/log.zig` — 分级日志（debug/info/warn/error）
 - `src/replication.zig` — 主从复制（应用层命令复制，Oplog 广播）
-- `src/tls_adapter.zig` — TLS 适配器，桥接 tls.Connection 到 std.Io.Reader/Writer
-- `crawl_novels.py` — 小说爬虫，为压缩基准测试提供真实文本数据
-- `src/compress_bench.zig` — 压缩基准测试工具
 - `src/http_server.zig` — HTTP 只读章节接口（签名 URL 验证 + 限流 + CORS）
-- `src/config.zig` — Redis conf 风格配置文件解析器
+- `src/tls_adapter.zig` — TLS 适配器，桥接 tls.Connection 到 std.Io.Reader/Writer
 
 ## Design Decisions
 
@@ -28,20 +26,71 @@
 - 16 个数据库通过 RocksDB Column Family 实现（可按小说/分类组织）
 - RwLock 并发：读共享锁，复合写排他锁
 - RocksDB Checkpoint 实现秒级热备份（硬链接 SST 文件）
-- AUTH 密码认证（`--requirepass`）
-- 主从复制：`--replicaof <host> <port>` 启动副本模式，最终一致性
-- TLS 加密：`--tls-cert/--tls-key` 启用 TLS 1.3，`--tls-replica` 副本 TLS 连接
-- 危险命令（flushdb/flushall）可禁用
-- HTTP 只读章节接口：`/chapter/{key}?sign=xxx&t=timestamp`，HMAC-SHA256 签名 URL 防遍历和未授权调用，令牌桶限流
-- Redis conf 风格配置文件：`--config path` 加载，CLI 参数可覆盖配置文件值。限流、存储引擎参数等放在配置文件
+- **CLI 管启动，配置文件管参数。** CLI 仅 7 个选项（config/host/port/data + 3 个 enable 开关），所有调优参数走配置文件
+- **安全默认值。** flushdb/flushall 默认禁用，需 `--enable-dangerous` 显式启用
+- HTTP 只读章节接口需 `--enable-http` 显式启用，HMAC-SHA256 签名 URL + 令牌桶限流
+- TLS 加密需 `--enable-tls` 显式启用
+- 主从复制：配置文件 `replicaof` 启动副本模式，最终一致性
+
+## CLI
+
+```
+novelkv [OPTIONS]
+
+Options:
+  -c, --config <PATH>        配置文件（Redis conf 风格）
+  -H, --host <HOST>          监听地址 (默认: 0.0.0.0)
+  -p, --port <PORT>          监听端口 (默认: 6379)
+  -d, --data <PATH>          数据目录 (默认: ./data)
+  --enable-http              启用 HTTP 章节接口
+  --enable-tls               启用 TLS 加密
+  --enable-dangerous         启用危险命令 (flushdb, flushall)
+  --help                     帮助
+```
+
+## Config File
+
+Redis conf 风格，`#` 注释，`key value` 每行一个：
+
+```
+# Server
+host 0.0.0.0
+port 6379
+data /var/lib/novelkv
+log-level info
+requirepass mysecret
+
+# TLS
+tls-cert /etc/novelkv/certs/server.pem
+tls-key /etc/novelkv/certs/server-key.pem
+tls-ca /etc/novelkv/certs/ca.pem
+tls-replica no
+
+# Replication
+replicaof master-host 6379
+masterauth master-password
+
+# HTTP Chapter API
+http-port 8080
+http-secret mysecret
+http-sign-ttl 3600
+http-rate-burst 30
+http-rate-refill 10
+
+# Storage Engine (tuned for novel text)
+write-buffer-size 64mb
+block-size 128kb
+compression-level 9
+bloom-bits 10
+```
 
 ## Supported Commands
-
-仅实现文本存储必要命令：
 
 | 类别 | 命令 |
 |---|---|
 | 读写 | GET, SET, DEL, MGET, MSET, EXISTS, SETNX, STRLEN |
+| Hash | HSET, HGET, HDEL, HLEN, HGETALL, HKEYS, HVALS, HEXISTS |
+| 扫描 | SCAN (cursor + MATCH + COUNT), KEYS (glob) |
 | 数据库 | SELECT, DBSIZE, FLUSHDB, FLUSHALL |
 | 备份 | SAVE, BGSAVE |
 | 连接 | PING, ECHO, QUIT, AUTH, COMMAND, CONFIG, INFO |
