@@ -473,9 +473,13 @@ pub const Database = struct {
     const META_KEY_PREFIX = "__novelkv:meta:db";
     const META_KEY_SUFFIX = ":value_bytes";
 
-    fn metaKey(db_index: usize) [META_KEY_PREFIX.len + 2 + META_KEY_SUFFIX.len:0]u8 {
-        var buf: [META_KEY_PREFIX.len + 2 + META_KEY_SUFFIX.len:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&buf, "{s}{d:0>2}{s}", .{ META_KEY_PREFIX, db_index, META_KEY_SUFFIX }, 0) catch unreachable;
+    fn metaKey(db_index: usize) [META_KEY_PREFIX.len + 3 + META_KEY_SUFFIX.len:0]u8 {
+        var buf: [META_KEY_PREFIX.len + 3 + META_KEY_SUFFIX.len:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&buf, "{s}{d:0>2}{s}", .{ META_KEY_PREFIX, db_index, META_KEY_SUFFIX }, 0) catch |err| {
+            log.err("metaKey format failed: {}", .{err});
+            @memcpy(buf[0..2], "__");
+            buf[2] = 0;
+        };
         return buf;
     }
 
