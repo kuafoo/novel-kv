@@ -83,6 +83,8 @@ pub const Database = struct {
     total_reads: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total_writes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     start_time: i64 = 0, // epoch seconds
+    /// Per-db total uncompressed value bytes (for accurate compression ratio)
+    total_value_bytes: [16]std.atomic.Value(u64) = undefined,
     /// SCAN 数字游标映射
     scan_cursor_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     scan_cursor_lock: std.atomic.Mutex = .unlocked,
@@ -299,7 +301,7 @@ pub const Database = struct {
                 _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
                 break :blk @as(i64, ts.sec);
             };
-            return Database{
+            var result = Database{
                 .db = db,
                 .allocator = allocator,
                 .cf_handles = cf_handles,
@@ -313,6 +315,8 @@ pub const Database = struct {
                 .start_time = start_time,
                 .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
             };
+            for (&result.total_value_bytes) |*v| v.* = std.atomic.Value(u64).init(0);
+            return result;
         }
 
         const db = maybe_db orelse unreachable;
@@ -336,7 +340,7 @@ pub const Database = struct {
             _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
             break :blk @as(i64, ts.sec);
         };
-        return Database{
+        var result = Database{
             .db = db,
             .allocator = allocator,
             .cf_handles = cf_handles,
@@ -350,6 +354,8 @@ pub const Database = struct {
             .start_time = start_time,
             .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
         };
+        for (&result.total_value_bytes) |*v| v.* = std.atomic.Value(u64).init(0);
+        return result;
     }
 
     pub fn close(self: *Database) void {
@@ -535,6 +541,22 @@ pub const Database = struct {
         var err: [*c]u8 = null;
         const cf = self.cf_handles[db_index];
 
+        // Track old value size for overwrite
+        const old_len: u64 = len: {
+            var val_len: usize = 0;
+            var get_err: [*c]u8 = null;
+            const old_val = rocksdb.rocksdb_get_cf(self.db, self.read_options, cf, key.ptr, key.len, &val_len, &get_err);
+            if (get_err) |e| {
+                rocksdb.rocksdb_free(e);
+                break :len 0;
+            }
+            if (old_val) |v| {
+                rocksdb.rocksdb_free(v);
+                break :len @intCast(val_len);
+            }
+            break :len 0;
+        };
+
         rocksdb.rocksdb_put_cf(self.db, self.write_options, cf, key.ptr, key.len, value.ptr, value.len, &err);
 
         if (err) |e| {
@@ -542,6 +564,9 @@ pub const Database = struct {
             rocksdb.rocksdb_free(e);
             return error.WriteFailed;
         }
+
+        _ = self.total_value_bytes[db_index].fetchAdd(value.len, .monotonic);
+        if (old_len > 0) _ = self.total_value_bytes[db_index].fetchSub(old_len, .monotonic);
     }
 
     /// Merge 操作：将 value 追加到 key 的现有值末尾（由 Merge Operator 处理）
@@ -562,6 +587,22 @@ pub const Database = struct {
         var err: [*c]u8 = null;
         const cf = self.cf_handles[db_index];
 
+        // Track old value size
+        const old_len: u64 = len: {
+            var val_len: usize = 0;
+            var get_err: [*c]u8 = null;
+            const old_val = rocksdb.rocksdb_get_cf(self.db, self.read_options, cf, key.ptr, key.len, &val_len, &get_err);
+            if (get_err) |e| {
+                rocksdb.rocksdb_free(e);
+                break :len 0;
+            }
+            if (old_val) |v| {
+                rocksdb.rocksdb_free(v);
+                break :len @intCast(val_len);
+            }
+            break :len 0;
+        };
+
         rocksdb.rocksdb_delete_cf(self.db, self.write_options, cf, key.ptr, key.len, &err);
 
         if (err) |e| {
@@ -569,6 +610,8 @@ pub const Database = struct {
             rocksdb.rocksdb_free(e);
             return error.DeleteFailed;
         }
+
+        if (old_len > 0) _ = self.total_value_bytes[db_index].fetchSub(old_len, .monotonic);
     }
 
     pub fn estimateKeyCount(self: *Database, db_index: usize) u64 {
@@ -607,6 +650,7 @@ pub const Database = struct {
     }
 
     pub fn flushDatabase(self: *Database, db_index: usize) !void {
+        self.total_value_bytes[db_index].store(0, .monotonic);
         if (db_index == 0) {
             const cf = self.cf_handles[0];
             var err: [*c]u8 = null;
@@ -811,8 +855,7 @@ pub const Database = struct {
     pub fn getCompressionStats(self: *Database, db_index: usize) struct { live_data_size: u64, sst_size: u64, ratio: f64 } {
         const cf = self.cf_handles[db_index];
 
-        var live_data: u64 = 0;
-        _ = rocksdb.rocksdb_property_int_cf(self.db, cf, "rocksdb.estimate-live-data-size", &live_data);
+        const live_data = self.total_value_bytes[db_index].load(.monotonic);
 
         var sst_size: u64 = 0;
         const val: [*c]u8 = rocksdb.rocksdb_property_value_cf(self.db, cf, "rocksdb.total-sst-files-size");

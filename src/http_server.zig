@@ -4,6 +4,15 @@ const std = @import("std");
 const storage = @import("storage.zig");
 const log = @import("log.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const flate = std.compress.flate;
+
+// Zstd C API (linked via libzstd.a)
+extern fn ZSTD_compress(dst: [*]u8, dstCapacity: usize, src: [*]const u8, srcSize: usize, compressionLevel: c_int) usize;
+extern fn ZSTD_compressBound(srcSize: usize) usize;
+extern fn ZSTD_isError(code: usize) c_uint;
+
+const AcceptEncoding = enum { none, gzip, zstd };
+const min_compress_size: usize = 256;
 
 pub const HttpConfig = struct {
     port: u16,
@@ -189,6 +198,7 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Datab
 
         // 读取 headers（限制总量 8KB）
         var connection_close = false;
+        var accept_encoding: AcceptEncoding = .none;
         var total_header_size: usize = 0;
         while (true) {
             const hdr_line = stream_reader.interface.takeDelimiterInclusive('\n') catch break;
@@ -196,7 +206,6 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Datab
             total_header_size += hdr.len;
             if (total_header_size > 8192) break;
             if (hdr.len == 0) break;
-            // 检查 Connection header
             if (std.mem.startsWith(u8, hdr, "Connection:")) {
                 const val = std.mem.trim(u8, hdr["Connection:".len..], " \t");
                 var buf: [16]u8 = undefined;
@@ -206,10 +215,13 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Datab
                         connection_close = true;
                     }
                 }
+            } else if (std.mem.startsWith(u8, hdr, "Accept-Encoding:")) {
+                const val = std.mem.trim(u8, hdr["Accept-Encoding:".len..], " \t");
+                accept_encoding = parseAcceptEncoding(val);
             }
         }
 
-        handleRequest(allocator, db, config, method, raw_path, &stream_writer.interface) catch {};
+        handleRequest(allocator, db, config, method, raw_path, &stream_writer.interface, accept_encoding) catch {};
 
         if (connection_close) keep_alive = false;
     }
@@ -222,7 +234,7 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, db: *storage.Datab
 // 请求处理
 // ============================================================
 
-fn handleRequest(allocator: std.mem.Allocator, db: *storage.Database, config: HttpConfig, method: []const u8, raw_path: []const u8, writer: *std.Io.Writer) !void {
+fn handleRequest(allocator: std.mem.Allocator, db: *storage.Database, config: HttpConfig, method: []const u8, raw_path: []const u8, writer: *std.Io.Writer, encoding: AcceptEncoding) !void {
     // CORS 预检
     if (std.mem.eql(u8, method, "OPTIONS")) {
         try writeCorsPreflight(writer);
@@ -313,7 +325,18 @@ fn handleRequest(allocator: std.mem.Allocator, db: *storage.Database, config: Ht
     };
 
     if (val) |v| {
-        try writeResponse(writer, 200, "OK", "text/plain; charset=utf-8", v, true);
+        if (encoding != .none and v.len >= min_compress_size) {
+            if (compressBody(allocator, v, encoding)) |compressed| {
+                defer allocator.free(compressed);
+                if (compressed.len < v.len) {
+                    try writeResponse(writer, 200, "OK", "text/plain; charset=utf-8", compressed, true, encoding);
+                    try writer.flush();
+                    storage.freeValue(v);
+                    return;
+                }
+            } else |_| {}
+        }
+        try writeResponse(writer, 200, "OK", "text/plain; charset=utf-8", v, true, .none);
         try writer.flush();
         storage.freeValue(v);
     } else {
@@ -416,9 +439,13 @@ fn parseQueryString(query: []const u8) QueryParams {
 // HTTP 响应
 // ============================================================
 
-fn writeResponse(writer: *std.Io.Writer, status: u16, status_text: []const u8, content_type: []const u8, body: []const u8, cors: bool) !void {
+fn writeResponse(writer: *std.Io.Writer, status: u16, status_text: []const u8, content_type: []const u8, body: []const u8, cors: bool, encoding: AcceptEncoding) !void {
     try writer.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
     try writer.print("Content-Type: {s}\r\n", .{content_type});
+    if (encoding != .none) {
+        try writer.print("Content-Encoding: {s}\r\n", .{@tagName(encoding)});
+        try writer.writeAll("Vary: Accept-Encoding\r\n");
+    }
     try writer.print("Content-Length: {d}\r\n", .{body.len});
     if (cors) {
         try writer.writeAll("Access-Control-Allow-Origin: *\r\n");
@@ -490,4 +517,78 @@ fn stripCR(data: []u8) []u8 {
     if (s.len > 0 and s[s.len - 1] == '\n') s = s[0 .. s.len - 1];
     if (s.len > 0 and s[s.len - 1] == '\r') s = s[0 .. s.len - 1];
     return s;
+}
+
+// ============================================================
+// 压缩支持 (gzip + zstd)
+// ============================================================
+
+fn parseAcceptEncoding(header: []const u8) AcceptEncoding {
+    var have_gzip = false;
+    var have_zstd = false;
+    var iter = std.mem.splitSequence(u8, header, ",");
+    while (iter.next()) |token| {
+        const trimmed = std.mem.trim(u8, token, " \t");
+        // strip quality value: "gzip;q=1.0" → "gzip"
+        const semi = std.mem.indexOfScalar(u8, trimmed, ';');
+        const enc = if (semi) |i| trimmed[0..i] else trimmed;
+        var buf: [16]u8 = undefined;
+        if (enc.len <= buf.len) {
+            const lower = std.ascii.lowerString(&buf, enc);
+            if (std.mem.eql(u8, lower, "gzip") or std.mem.eql(u8, lower, "deflate")) {
+                have_gzip = true;
+            } else if (std.mem.eql(u8, lower, "zstd")) {
+                have_zstd = true;
+            } else if (std.mem.eql(u8, lower, "*")) {
+                have_gzip = true;
+                have_zstd = true;
+            }
+        }
+    }
+    if (have_zstd) return .zstd;
+    if (have_gzip) return .gzip;
+    return .none;
+}
+
+fn compressBody(allocator: std.mem.Allocator, data: []const u8, encoding: AcceptEncoding) ![]u8 {
+    return switch (encoding) {
+        .gzip => try gzipCompress(allocator, data),
+        .zstd => try zstdCompress(allocator, data),
+        .none => unreachable,
+    };
+}
+
+fn gzipCompress(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    var alloc_writer = try std.Io.Writer.Allocating.initCapacity(allocator, data.len / 2 + 64);
+    errdefer {
+        const buf = alloc_writer.writer.buffer;
+        if (buf.len > 0) allocator.rawFree(buf, alloc_writer.alignment, @returnAddress());
+    }
+
+    var work_buf: [flate.max_window_len]u8 = undefined;
+    var compressor = try flate.Compress.init(
+        &alloc_writer.writer,
+        &work_buf,
+        .gzip,
+        flate.Compress.Options.level_6,
+    );
+    try compressor.writer.writeAll(data);
+    try compressor.finish();
+
+    return try alloc_writer.toOwnedSlice();
+}
+
+fn zstdCompress(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    const bound = ZSTD_compressBound(data.len);
+    const out_buf = try allocator.alloc(u8, bound);
+    errdefer allocator.free(out_buf);
+
+    const result = ZSTD_compress(out_buf.ptr, bound, data.ptr, data.len, 3);
+    if (ZSTD_isError(result) != 0) return error.CompressionFailed;
+
+    if (allocator.realloc(out_buf, result)) |resized| {
+        return resized;
+    } else |_| {
+        return out_buf[0..result];
+    }
 }
