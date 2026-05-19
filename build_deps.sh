@@ -5,8 +5,8 @@ DL="$BASE/downloads"
 DEPS="$BASE/deps"
 NPROC=$(nproc)
 
-CC="zig cc -target native-native"
-CXX="zig c++ -target native-native"
+CC="zig cc -target x86_64-linux-gnu -mcpu=x86_64"
+CXX="zig c++ -target x86_64-linux-gnu -mcpu=x86_64"
 AR="zig ar"
 
 build_zstd() {
@@ -63,7 +63,7 @@ build_rocksdb() {
         local rel="${f#$SRC/}"
         local obj="$BUILD/${rel%.cc}.o"
         mkdir -p "$(dirname "$obj")"
-        $CXX -O2 -std=c++17 -fPIC -DNDEBUG -DROCKSDB_PLATFORM_POSIX -DOS_LINUX \
+        $CXX -O2 -std=c++20 -fPIC -DNDEBUG -DROCKSDB_PLATFORM_POSIX -DOS_LINUX \
             -DROCKSDB_LIB_IO_POSIX -DZSTD -DSNAPPY \
             -DZSTD_STATIC_LINKING_ONLY \
             -I"$SRC" -I"$SRC/include" \
