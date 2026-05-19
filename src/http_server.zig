@@ -276,7 +276,7 @@ fn handleRequest(allocator: std.mem.Allocator, db: *storage.Database, config: Ht
     };
     defer allocator.free(chapterkey);
 
-    if (!validateChapterKey(chapterkey)) {
+    if (!validateUserKey(chapterkey)) {
         try writeErrorResponse(writer, 400, "Bad Request", true, false);
         try writer.flush();
         return;
@@ -374,7 +374,7 @@ fn verifySignature(chapterkey: []const u8, t_str: []const u8, provided_sign: []c
 // Key 验证
 // ============================================================
 
-fn validateChapterKey(key: []const u8) bool {
+fn validateUserKey(key: []const u8) bool {
     if (key.len == 0 or key.len > 1024) return false;
     for (key) |c| {
         if (c == 0) return false;

@@ -316,6 +316,7 @@ pub const Database = struct {
                 .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
             };
             for (&result.total_value_bytes) |*v| v.* = std.atomic.Value(u64).init(0);
+            // New database, no calibration needed
             return result;
         }
 
@@ -355,6 +356,10 @@ pub const Database = struct {
             .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
         };
         for (&result.total_value_bytes) |*v| v.* = std.atomic.Value(u64).init(0);
+        // Load persisted counters / calibrate from existing data
+        for (0..MAX_DATABASES) |i| {
+            result.calibrateTotalValueBytes(i);
+        }
         return result;
     }
 
@@ -463,6 +468,94 @@ pub const Database = struct {
         return false;
     }
 
+    // ---- Internal meta key helpers (stored in db0 default CF) ----
+
+    const META_KEY_PREFIX = "__novelkv:meta:db";
+    const META_KEY_SUFFIX = ":value_bytes";
+
+    fn metaKey(db_index: usize) [META_KEY_PREFIX.len + 2 + META_KEY_SUFFIX.len:0]u8 {
+        var buf: [META_KEY_PREFIX.len + 2 + META_KEY_SUFFIX.len:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&buf, "{s}{d:0>2}{s}", .{ META_KEY_PREFIX, db_index, META_KEY_SUFFIX }, 0) catch unreachable;
+        return buf;
+    }
+
+    fn persistTotalValueBytes(self: *Database, db_index: usize) void {
+        const key = metaKey(db_index);
+        const value = self.total_value_bytes[db_index].load(.monotonic);
+        if (value == 0) {
+            // delete the meta key
+            var err: [*c]u8 = null;
+            rocksdb.rocksdb_delete_cf(self.db, self.write_options, self.cf_handles[0], &key, key.len, &err);
+            if (err) |e| {
+                log.warn("failed to delete meta key for db{d}: {s}", .{ db_index, e });
+                rocksdb.rocksdb_free(e);
+            }
+            return;
+        }
+        var buf: [20]u8 = undefined;
+        const val_str = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
+        var err: [*c]u8 = null;
+        rocksdb.rocksdb_put_cf(self.db, self.write_options, self.cf_handles[0], &key, key.len, val_str.ptr, val_str.len, &err);
+        if (err) |e| {
+            log.warn("failed to persist meta key for db{d}: {s}", .{ db_index, e });
+            rocksdb.rocksdb_free(e);
+        }
+    }
+
+    fn loadTotalValueBytes(self: *Database, db_index: usize) u64 {
+        const key = metaKey(db_index);
+        var val_len: usize = 0;
+        var err: [*c]u8 = null;
+        const val = rocksdb.rocksdb_get_cf(self.db, self.read_options, self.cf_handles[0], &key, key.len, &val_len, &err);
+        if (err) |e| {
+            rocksdb.rocksdb_free(e);
+            return 0;
+        }
+        if (val) |v| {
+            defer rocksdb.rocksdb_free(v);
+            return std.fmt.parseInt(u64, v[0..val_len], 10) catch 0;
+        }
+        return 0;
+    }
+
+    /// 启动校准：如果 total_value_bytes 为 0 但 db 有数据，遍历统计
+    fn calibrateTotalValueBytes(self: *Database, db_index: usize) void {
+        const saved = self.loadTotalValueBytes(db_index);
+        if (saved > 0) {
+            self.total_value_bytes[db_index].store(saved, .monotonic);
+            log.info("db{d}: loaded total_value_bytes = {d} from meta key", .{ db_index, saved });
+            return;
+        }
+        const key_count = self.estimateKeyCount(db_index);
+        if (key_count == 0) return;
+        // Only calibrate if no saved value and has data (upgrade from old version)
+        // Skip internal meta keys for db0
+        log.info("db{d}: calibrating total_value_bytes (upgrade from old version)...", .{db_index});
+        const cf = self.cf_handles[db_index];
+        const iter = rocksdb.rocksdb_create_iterator_cf(self.db, self.read_options, cf);
+        defer rocksdb.rocksdb_iter_destroy(iter);
+        rocksdb.rocksdb_iter_seek_to_first(iter);
+        var total: u64 = 0;
+        var count: u64 = 0;
+        while (rocksdb.rocksdb_iter_valid(iter) != 0) {
+            var klen: usize = 0;
+            var vlen: usize = 0;
+            const k = rocksdb.rocksdb_iter_key(iter, &klen);
+            _ = rocksdb.rocksdb_iter_value(iter, &vlen);
+            // Skip internal meta keys
+            if (db_index == 0 and klen >= META_KEY_PREFIX.len and std.mem.eql(u8, k[0..META_KEY_PREFIX.len], META_KEY_PREFIX)) {
+                rocksdb.rocksdb_iter_next(iter);
+                continue;
+            }
+            total += @as(u64, @intCast(vlen));
+            count += 1;
+            rocksdb.rocksdb_iter_next(iter);
+        }
+        self.total_value_bytes[db_index].store(total, .monotonic);
+        self.persistTotalValueBytes(db_index);
+        log.info("db{d}: calibrated total_value_bytes = {d} ({d} keys)", .{ db_index, total, count });
+    }
+
     /// 单 key 读取
     pub fn get(self: *Database, key: []const u8, db_index: usize) error{ReadFailed}!?[]const u8 {
         var err: [*c]u8 = null;
@@ -567,6 +660,7 @@ pub const Database = struct {
 
         _ = self.total_value_bytes[db_index].fetchAdd(value.len, .monotonic);
         if (old_len > 0) _ = self.total_value_bytes[db_index].fetchSub(old_len, .monotonic);
+        self.persistTotalValueBytes(db_index);
     }
 
     /// Merge 操作：将 value 追加到 key 的现有值末尾（由 Merge Operator 处理）
@@ -612,6 +706,7 @@ pub const Database = struct {
         }
 
         if (old_len > 0) _ = self.total_value_bytes[db_index].fetchSub(old_len, .monotonic);
+        self.persistTotalValueBytes(db_index);
     }
 
     pub fn estimateKeyCount(self: *Database, db_index: usize) u64 {
@@ -651,6 +746,7 @@ pub const Database = struct {
 
     pub fn flushDatabase(self: *Database, db_index: usize) !void {
         self.total_value_bytes[db_index].store(0, .monotonic);
+        self.persistTotalValueBytes(db_index);
         if (db_index == 0) {
             const cf = self.cf_handles[0];
             var err: [*c]u8 = null;
@@ -872,6 +968,21 @@ pub const Database = struct {
         const cf = self.cf_handles[db_index];
         var err: [*c]u8 = null;
 
+        // Pre-fetch old value sizes for byte tracking
+        var delta: i64 = 0;
+        for (pairs) |pair| {
+            var val_len: usize = 0;
+            var get_err: [*c]u8 = null;
+            const old_val = rocksdb.rocksdb_get_cf(self.db, self.read_options, cf, pair.key.ptr, pair.key.len, &val_len, &get_err);
+            if (get_err) |e| {
+                rocksdb.rocksdb_free(e);
+            } else if (old_val) |v| {
+                rocksdb.rocksdb_free(v);
+                delta -= @as(i64, @intCast(val_len));
+            }
+            delta += @as(i64, @intCast(pair.value.len));
+        }
+
         const batch = rocksdb.rocksdb_writebatch_create();
         defer rocksdb.rocksdb_writebatch_destroy(batch);
 
@@ -885,6 +996,13 @@ pub const Database = struct {
             rocksdb.rocksdb_free(e);
             return error.WriteFailed;
         }
+
+        if (delta > 0) {
+            _ = self.total_value_bytes[db_index].fetchAdd(@intCast(delta), .monotonic);
+        } else if (delta < 0) {
+            _ = self.total_value_bytes[db_index].fetchSub(@intCast(-delta), .monotonic);
+        }
+        self.persistTotalValueBytes(db_index);
     }
 };
 
