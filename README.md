@@ -133,9 +133,10 @@ GET /v1/data/{key}?sign=xxx&t=123456789
 sign = hex(HMAC-SHA256(secret, key + t))
 ```
 
-Python 生成示例：
+多语言生成示例：
 
 ```python
+# Python
 import hmac, hashlib, time
 
 secret = b"mysecret"
@@ -143,6 +144,72 @@ key = "chapter1"
 t = str(int(time.time()))
 sign = hmac.new(secret, (key + t).encode(), hashlib.sha256).hexdigest()
 url = f"/v1/data/{key}?sign={sign}&t={t}"
+```
+
+```php
+// PHP
+$secret = "mysecret";
+$key = "chapter1";
+$t = (string)time();
+$sign = hash_hmac("sha256", $key . $t, $secret);
+$url = "/v1/data/{$key}?sign={$sign}&t={$t}";
+```
+
+```go
+// Go
+package main
+
+import (
+    "crypto/hmac"
+    "crypto/sha256"
+    "encoding/hex"
+    "fmt"
+    "strconv"
+    "time"
+)
+
+func main() {
+    secret := []byte("mysecret")
+    key := "chapter1"
+    t := strconv.FormatInt(time.Now().Unix(), 10)
+    mac := hmac.New(sha256.New, secret)
+    mac.Write([]byte(key + t))
+    sign := hex.EncodeToString(mac.Sum(nil))
+    fmt.Printf("/v1/data/%s?sign=%s&t=%s\n", key, sign, t)
+}
+```
+
+```java
+// Java
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.time.Instant;
+
+public class SignUrl {
+    public static void main(String[] args) throws Exception {
+        String secret = "mysecret";
+        String key = "chapter1";
+        String t = String.valueOf(Instant.now().getEpochSecond());
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(secret.getBytes(), "HmacSHA256"));
+        StringBuilder sb = new StringBuilder();
+        for (byte b : mac.doFinal((key + t).getBytes())) {
+            sb.append(String.format("%02x", b));
+        }
+        System.out.printf("/v1/data/%s?sign=%s&t=%s%n", key, sb, t);
+    }
+}
+```
+
+```javascript
+// Node.js
+const crypto = require("crypto");
+
+const secret = "mysecret";
+const key = "chapter1";
+const t = Math.floor(Date.now() / 1000).toString();
+const sign = crypto.createHmac("sha256", secret).update(key + t).digest("hex");
+const url = `/v1/data/${key}?sign=${sign}&t=${t}`;
 ```
 
 ### 安全机制
