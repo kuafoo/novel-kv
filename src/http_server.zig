@@ -254,14 +254,14 @@ fn handleRequest(allocator: std.mem.Allocator, db: *storage.Database, config: Ht
     const path = path_and_query.next() orelse raw_path;
     const query_str = path_and_query.next() orelse "";
 
-    // 路径必须以 /chapter/ 开头
-    if (!std.mem.startsWith(u8, path, "/chapter/")) {
+    // 路径必须以 /v1/data/ 开头
+    if (!std.mem.startsWith(u8, path, "/v1/data/")) {
         try writeErrorResponse(writer, 404, "Not Found", true, false);
         try writer.flush();
         return;
     }
 
-    const encoded_key = path["/chapter/".len..];
+    const encoded_key = path["/v1/data/".len..];
     if (encoded_key.len == 0) {
         try writeErrorResponse(writer, 400, "Bad Request", true, false);
         try writer.flush();

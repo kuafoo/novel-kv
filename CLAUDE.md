@@ -95,7 +95,7 @@ bloom-bits 10
 | 备份 | SAVE, BGSAVE |
 | 连接 | PING, ECHO, QUIT, AUTH, COMMAND, CONFIG, INFO |
 | 复制 | REPLCONF, PSYNC |
-| HTTP | GET /chapter/{key}?sign=xxx&t=timestamp (只读，签名验证) |
+| HTTP | GET /v1/data/{key}?sign=xxx&t=timestamp (只读，签名验证) |
 
 ## Build & Test
 

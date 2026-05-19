@@ -27,7 +27,7 @@
 | 备份 | SAVE, BGSAVE |
 | 连接 | PING, ECHO, QUIT, AUTH, COMMAND, CONFIG, INFO |
 | 复制 | REPLCONF, PSYNC |
-| HTTP | GET /chapter/{key}?sign=xxx&t=timestamp (只读，签名验证) |
+| HTTP | GET /v1/data/{key}?sign=xxx&t=timestamp (只读，签名验证) |
 
 ## 快速开始
 
@@ -120,17 +120,17 @@ HTTP 只读接口供前端直接加载小说章节内容，无需中间层。采
 ### URL 格式
 
 ```
-GET /chapter/{chapterkey}?sign=xxx&t=123456789
+GET /v1/data/{key}?sign=xxx&t=123456789
 ```
 
-- `chapterkey` — RocksDB 中的 key
+- `key` — RocksDB 中的 key
 - `sign` — HMAC-SHA256 签名（hex 编码，64 字符）
 - `t` — Unix 时间戳（十进制），服务端校验不超过 TTL
 
 ### 签名算法
 
 ```
-sign = hex(HMAC-SHA256(secret, chapterkey + t))
+sign = hex(HMAC-SHA256(secret, key + t))
 ```
 
 Python 生成示例：
@@ -142,7 +142,7 @@ secret = b"mysecret"
 key = "chapter1"
 t = str(int(time.time()))
 sign = hmac.new(secret, (key + t).encode(), hashlib.sha256).hexdigest()
-url = f"/chapter/{key}?sign={sign}&t={t}"
+url = f"/v1/data/{key}?sign={sign}&t={t}"
 ```
 
 ### 安全机制
@@ -171,8 +171,8 @@ url = f"/chapter/{key}?sign={sign}&t={t}"
 下载 [Latest Release](https://github.com/kuafoo/novel-kv/releases/latest) 并安装：
 
 ```bash
-tar xzf novelkv-v1.2.0-linux-x86_64.tar.gz
-cd novelkv-v1.2.0-linux-x86_64
+tar xzf novelkv-v1.3.0-linux-x86_64.tar.gz
+cd novelkv-v1.3.0-linux-x86_64
 sudo ./install.sh
 ```
 
@@ -227,6 +227,36 @@ src/replication.zig  — 主从复制，Oplog 广播
 src/tls_adapter.zig  — TLS 适配器
 src/http_server.zig  — HTTP 只读章节接口（签名 URL + 限流 + CORS）
 ```
+
+## 性能参考
+
+基于真实中文小说章节数据的实测结果（Zstd 字典压缩，level 9，128KB block size）。
+
+### 实测数据
+
+| 指标 | 值 |
+|------|-----|
+| Key 数量 | 197.2 万 |
+| 单 key 平均原始大小 | 7.5 KB |
+| 原始数据总量 | 14.0 GB |
+| SST 磁盘占用 | 5.1 GB |
+| **压缩比** | **2.73x** |
+| 空闲 RSS | ~26 MB |
+| Block Cache 容量 | 256 MB |
+| 导入速度（单连接 TLS） | ~200 keys/s |
+
+### 容量预估
+
+基于实测数据的单 key 平均值（原始 7.5 KB，压缩后 2.7 KB）线性推算：
+
+| 规模 | 原始数据 | SST 占用 | Block Cache 建议 | 磁盘需求 |
+|------|----------|----------|-----------------|---------|
+| 100 万 | 7 GB | 2.6 GB | 256 MB | 3 GB |
+| 1000 万 | 72 GB | 27 GB | 256 MB | 30 GB |
+| 5000 万 | 362 GB | 135 GB | 1 GB | 140 GB |
+| 1 亿 | 724 GB | 270 GB | 2-4 GB | 280 GB |
+
+> 千万级当前默认配置即可支撑，仅需磁盘空间。亿级建议调大 `block-cache-size` 和 `max-write-buffer-number`，RocksDB 本身为十亿级 key 设计，无架构瓶颈。
 
 ## License
 
