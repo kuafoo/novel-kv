@@ -28,12 +28,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", "1.3.0");
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    exe_mod.addImport("build_options", options.createModule());
     addDeps(b, exe_mod, target, optimize);
 
     const exe = b.addExecutable(.{
