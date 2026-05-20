@@ -82,6 +82,8 @@ write-buffer-size 64mb
 block-size 128kb
 compression-level 9
 bloom-bits 10
+# dict-size 256kb
+# zstd-train-bytes 10000000
 ```
 
 ## Supported Commands
