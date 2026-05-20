@@ -38,6 +38,8 @@ pub const Config = struct {
     block_size: ?usize = null,
     compression_level: ?c_int = null,
     bloom_bits_per_key: ?f64 = null,
+    dict_size: ?usize = null,
+    zstd_train_bytes: ?c_int = null,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         const fields = .{
@@ -162,6 +164,10 @@ fn applyValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8, raw_v
         cfg.compression_level = try std.fmt.parseInt(c_int, value, 10);
     } else if (eql(key, "bloom-bits")) {
         cfg.bloom_bits_per_key = try std.fmt.parseFloat(f64, value);
+    } else if (eql(key, "dict-size")) {
+        cfg.dict_size = try parseSize(value);
+    } else if (eql(key, "zstd-train-bytes")) {
+        cfg.zstd_train_bytes = try std.fmt.parseInt(c_int, value, 10);
     } else {
         log.warn("Config line {d}: unknown key '{s}', ignored", .{ line_num, key });
     }

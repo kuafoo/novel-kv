@@ -224,6 +224,8 @@ pub fn main(init: std.process.Init) !void {
         if (c.block_size) |v| db_config.block_size = v;
         if (c.compression_level) |v| db_config.compression_level = v;
         if (c.bloom_bits_per_key) |v| db_config.bloom_bits_per_key = v;
+        if (c.dict_size) |v| db_config.dict_size = @intCast(v);
+        if (c.zstd_train_bytes) |v| db_config.zstd_train_bytes = v;
     }
 
     var db = storage.Database.open(allocator, .{

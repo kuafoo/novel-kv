@@ -19,8 +19,8 @@ pub const KeyValue = struct {
 pub const Config = struct {
     path: [:0]const u8,
     compression_level: c_int = 9,
-    dict_size: c_int = 256 * 1024,
-    zstd_train_bytes: c_int = 10_000_000,
+    dict_size: c_int = 0,
+    zstd_train_bytes: c_int = 0,
     block_size: usize = 128 * 1024,
     write_buffer_size: usize = 64 * 1024 * 1024,
     max_write_buffer_number: c_int = 2,
@@ -43,6 +43,8 @@ pub const DbConfig = struct {
     block_size: ?usize = null,
     compression_level: ?c_int = null,
     bloom_bits_per_key: ?f64 = null,
+    dict_size: ?c_int = null,
+    zstd_train_bytes: ?c_int = null,
 };
 
 pub const TlsConfig = struct {
@@ -101,6 +103,8 @@ pub const Database = struct {
         const wb_size = config.db_config.write_buffer_size orelse config.write_buffer_size;
         const wb_num = config.db_config.max_write_buffer_number orelse config.max_write_buffer_number;
         const bloom_bits = config.db_config.bloom_bits_per_key orelse config.bloom_bits_per_key;
+        const dict_sz = config.db_config.dict_size orelse config.dict_size;
+        const train_bytes = config.db_config.zstd_train_bytes orelse config.zstd_train_bytes;
 
         const options = rocksdb.rocksdb_options_create();
         defer rocksdb.rocksdb_options_destroy(options);
@@ -109,9 +113,9 @@ pub const Database = struct {
 
         // ---- 压缩配置：Zstd 字典压缩，针对小说文本优化压缩比 ----
         rocksdb.rocksdb_options_set_compression(options, 7); // 7 = kZSTD
-        rocksdb.rocksdb_options_set_compression_options(options, 0, comp_level, 0, config.dict_size);
-        rocksdb.rocksdb_options_set_compression_options_zstd_max_train_bytes(options, config.zstd_train_bytes);
-        rocksdb.rocksdb_options_set_compression_options_use_zstd_dict_trainer(options, 1);
+        rocksdb.rocksdb_options_set_compression_options(options, 0, comp_level, 0, dict_sz);
+        rocksdb.rocksdb_options_set_compression_options_zstd_max_train_bytes(options, train_bytes);
+        rocksdb.rocksdb_options_set_compression_options_use_zstd_dict_trainer(options, if (dict_sz > 0) 1 else 0);
 
         // ---- Block-Based Table 配置：Bloom Filter + Block Cache ----
         const block_opts = rocksdb.rocksdb_block_based_options_create();
