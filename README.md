@@ -4,16 +4,18 @@
 
 ## 特性
 
-- **RESP 兼容** — 支持 redis-cli 及所有 Redis 客户端库
+- **RESP 兼容** — 支持 redis-cli 及所有 Redis 客户端库（redis-py ≥7、Jedis、Lettuce、ioredis 等）
 - **高压缩比** — Zstd 字典压缩，针对中文小说文本优化，压缩比远优于通用压缩
 - **16 个数据库** — 通过 RocksDB Column Family 实现，可按小说/分类组织
 - **并发安全** — RwLock 并发控制，读共享锁，复合写排他锁
+- **Hash 类型** — HSET/HGET/HDEL/HGETALL 等，DEL 自动清理字段，EXISTS/TYPE 识别 hash
 - **主从复制** — 应用层命令复制，Oplog 广播，最终一致性
 - **TLS 加密** — TLS 1.3 支持，客户端与副本连接均可加密
 - **密码认证** — AUTH 密码验证
 - **热备份** — 基于 RocksDB Checkpoint，秒级硬链接备份
 - **HTTP 章节接口** — 只读 HTTP API，HMAC-SHA256 签名 URL 防遍历，令牌桶限流，前端可直接加载小说内容
 - **配置文件** — Redis conf 风格配置文件，CLI 仅保留启动开关，安全默认值
+- **交互式安装** — install.sh 支持 TTY 交互配置端口/数据目录/密码等
 
 ## 支持命令
 
@@ -25,7 +27,7 @@
 | 计数 | INCR, INCRBY, DECR, DECRBY |
 | 数据库 | SELECT, DBSIZE, FLUSHDB, FLUSHALL |
 | 备份 | SAVE, BGSAVE |
-| 连接 | PING, ECHO, QUIT, AUTH, COMMAND, CONFIG, INFO |
+| 连接 | PING, ECHO, QUIT, AUTH, COMMAND, CONFIG, INFO, CLIENT, HELLO, RESET |
 | 复制 | REPLCONF, PSYNC |
 | HTTP | GET /v1/data/{key}?sign=xxx&t=timestamp (只读，签名验证) |
 
@@ -75,6 +77,12 @@ CLI 仅保留启动开关，所有调优参数走配置文件：
   --enable-dangerous         启用危险命令 (flushdb, flushall，默认禁用)
   --help                     帮助
 ```
+
+### 子命令
+
+- **`gen-certs`** — 生成自签名 ECDSA P-256 TLS 证书
+- **`gen-secret`** — 生成随机 hex 密码（用于 `requirepass` / `http-secret`）
+- **`migrate-hash-prefix`** — 将旧版本 hash 内部前缀（`H:` / `HM:`）迁移到新版本（`__novelkv:h:` / `__novelkv:hm:`），详见下方[升级指南](#从-v130-及更早版本升级)
 
 ## 配置文件
 
@@ -240,9 +248,23 @@ const url = `/v1/data/${key}?sign=${sign}&t=${t}`;
 下载 [Latest Release](https://github.com/kuafoo/novel-kv/releases/latest) 并安装：
 
 ```bash
-tar xzf novelkv-v1.3.0-linux-x86_64.tar.gz
-cd novelkv-v1.3.0-linux-x86_64
+tar xzf novelkv-v1.4.0-linux-x86_64.tar.gz
+cd novelkv-v1.4.0-linux-x86_64
 sudo ./install.sh
+```
+
+`install.sh` 检测到 TTY 时会交互式询问监听地址/端口/数据目录/密码；非 TTY 环境（CI/脚本）使用默认值，可用参数覆盖：
+
+```
+sudo ./install.sh [OPTIONS]
+
+选项：
+  --prefix PATH        安装路径前缀 (默认: /usr/local)
+  --host ADDR          监听地址 (默认: 0.0.0.0)
+  --port PORT          监听端口 (默认: 6379)
+  --data PATH          数据目录 (默认: /var/lib/novelkv)
+  --password PASS      认证密码
+  --non-interactive    非交互模式，使用默认值/命令行参数
 ```
 
 安装后编辑配置文件：
@@ -255,6 +277,33 @@ sudo journalctl -u novelkv -f
 ```
 
 systemd 服务默认使用 `--config /etc/novelkv/novelkv.conf`，可在 `/etc/novelkv/novelkv.env` 中追加 CLI 覆盖参数。
+
+### 从 v1.3.0 及更早版本升级
+
+v1.4.0 将 hash 内部前缀从 `H:` / `HM:` 重命名为 `__novelkv:h:` / `__novelkv:hm:`，以避免与以 `H:`/`HM:` 开头的用户键名冲突。**已有 hash 数据的部署升级前必须运行迁移工具**：
+
+```bash
+# 1. 停止服务
+sudo systemctl stop novelkv
+
+# 2. 替换二进制（用新版本 install.sh 或手动 cp）
+sudo cp novelkv /usr/local/bin/novelkv
+
+# 3. 预览迁移量（不写入）
+sudo novelkv migrate-hash-prefix -d /var/lib/novelkv --dry-run
+
+# 4. 执行迁移
+sudo novelkv migrate-hash-prefix -d /var/lib/novelkv
+
+# 5. 启动服务
+sudo systemctl start novelkv
+```
+
+迁移工具支持 `--config` 从配置文件读取 data 目录：
+
+```bash
+sudo novelkv migrate-hash-prefix --config /etc/novelkv/novelkv.conf --dry-run
+```
 
 ### 副本部署
 
@@ -278,6 +327,25 @@ sudo chmod 600 /etc/novelkv/certs/server-key.pem
 
 ## 测试
 
+**功能正确性测试**（pytest + redis-py，100 个用例覆盖命令契约与计数器一致性）：
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r tests/requirements.txt
+zig build
+python -m pytest tests/ -v
+```
+
+测试覆盖：
+- `test_string_lifecycle.py` — SET/GET/DEL/EXISTS/TYPE/STRLEN/MGET/MSET 对称性 + DBSIZE 归零
+- `test_hash_lifecycle.py` — HSET/HGET/HDEL/DEL hash/EXISTS/TYPE/HLEN/HKEYS/HVALS/HGETALL
+- `test_scan_keys.py` — SCAN cursor 终止、KEYS glob、内部键不泄漏
+- `test_counters.py` — DBSIZE 与 INFO live_data_size 在每次写/删后一致
+- `test_type_consistency.py` — 同一 key 在 TYPE/EXISTS/DBSIZE/SCAN/KEYS 视角下一致
+- `test_prefix_collision.py` — 用户键名以 H:/HM: 开头的边界情况
+
+**存储层单元测试**：
+
 ```bash
 zig build test
 ```
@@ -285,16 +353,17 @@ zig build test
 ## 技术架构
 
 ```
-src/main.zig         — CLI 入口，功能开关，信号处理
+src/main.zig         — CLI 入口，功能开关，信号处理，子命令 (gen-certs/gen-secret/migrate-hash-prefix)
 src/config.zig       — Redis conf 风格配置文件解析器
 src/server.zig       — TCP 服务，RESP 协议解析，连接管理
-src/command.zig      — 命令分发与处理
-src/storage.zig      — RocksDB 封装，Column Family，RwLock 并发
-src/resp.zig         — RESP 协议写入
+src/command.zig      — 命令分发与处理（string/hash/scan/连接/复制）
+src/storage.zig      — RocksDB 封装，Column Family，RwLock 并发，原子计数器
+src/resp.zig         — RESP 协议写入（RESP2/RESP3 双格式）
 src/log.zig          — 分级日志
 src/replication.zig  — 主从复制，Oplog 广播
 src/tls_adapter.zig  — TLS 适配器
 src/http_server.zig  — HTTP 只读章节接口（签名 URL + 限流 + CORS）
+tests/               — pytest 功能正确性测试套件（100 用例）
 ```
 
 ## 存储引擎调优
