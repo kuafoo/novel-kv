@@ -722,5 +722,14 @@ fn freeCommandResult(allocator: std.mem.Allocator, result: command.CommandResult
                 allocator.free(items);
             }
         },
+        .map_pairs => |maybe_pairs| {
+            if (maybe_pairs) |pairs| {
+                for (pairs) |p| {
+                    allocator.free(p.k);
+                    allocator.free(p.v);
+                }
+                allocator.free(pairs);
+            }
+        },
     }
 }

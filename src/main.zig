@@ -40,6 +40,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first_arg, "gen-secret")) {
             runGenSecret(io, allocator, args);
             return;
+        } else if (std.mem.eql(u8, first_arg, "migrate-hash-prefix")) {
+            runMigrateHashPrefix(io, allocator, args) catch |e| {
+                log.err("migrate-hash-prefix failed: {}", .{e});
+                return e;
+            };
+            return;
         }
     }
 
@@ -510,4 +516,94 @@ fn runGenSecret(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args
     }
 
     std.debug.print("{s}\n", .{hex_buf[0 .. byte_count * 2]});
+}
+
+// === migrate-hash-prefix 子命令 ===
+
+fn runMigrateHashPrefix(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args.Iterator) !void {
+    var data_path: []const u8 = "./data";
+    var config_path: ?[]const u8 = null;
+    var dry_run = false;
+
+    var iter = args;
+    while (iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--data") or std.mem.eql(u8, arg, "-d")) {
+            if (iter.next()) |v| data_path = v;
+        } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            if (iter.next()) |v| config_path = v;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--help")) {
+            std.debug.print(
+                \\Usage: novelkv migrate-hash-prefix [OPTIONS]
+                \\
+                \\将旧版本 hash 内部前缀 (H: / HM:) 迁移到新版本 (__novelkv:h: / __novelkv:hm:)。
+                \\必须在 NovelKV 服务未运行时执行（独占数据库）。
+                \\
+                \\Options:
+                \\  -d, --data <PATH>      数据目录 (默认: ./data)
+                \\  -c, --config <PATH>    配置文件 (从中读取 data 路径)
+                \\      --dry-run          只扫描统计，不写入
+                \\
+            , .{});
+            return;
+        }
+    }
+
+    // 从配置文件读取 data 目录（如提供）
+    if (config_path) |path| {
+        var file_cfg = config_mod.parseFromFile(io, allocator, path) catch |e| {
+            log.err("Failed to load config {s}: {}", .{ path, e });
+            return e;
+        };
+        defer file_cfg.deinit(allocator);
+        if (file_cfg.data) |d| data_path = d;
+    }
+
+    log.info("Opening database at: {s}", .{data_path});
+    log.info("Dry run: {}", .{dry_run});
+
+    const data_path_z = try allocator.dupeZ(u8, data_path);
+    defer allocator.free(data_path_z);
+
+    var db = storage.Database.open(allocator, .{
+        .path = data_path_z,
+    }) catch |e| {
+        log.err("Failed to open database: {}", .{e});
+        return e;
+    };
+    defer db.close();
+
+    if (dry_run) {
+        log.info("Dry run mode: counting old-prefix keys without writing", .{});
+        // dry-run: 直接扫描统计，不调用 migrateHashPrefix
+        var data_count: u64 = 0;
+        var meta_count: u64 = 0;
+        for (0..storage.MAX_DATABASES) |db_index| {
+            const cf = db.cf_handles[db_index];
+            const rocksdb = @import("rocksdb");
+            const it = rocksdb.rocksdb_create_iterator_cf(db.db, db.read_options, cf);
+            defer rocksdb.rocksdb_iter_destroy(it);
+            rocksdb.rocksdb_iter_seek(it, "H:", 2);
+            while (rocksdb.rocksdb_iter_valid(it) != 0) {
+                var kl: usize = 0;
+                const k = rocksdb.rocksdb_iter_key(it, &kl);
+                if (kl < 1 or k[0] != 'H') break;
+                const is_h = (kl >= 2 and k[1] == ':');
+                const is_hm = (kl >= 3 and k[1] == 'M' and k[2] == ':');
+                if (is_hm) {
+                    meta_count += 1;
+                } else if (is_h) {
+                    data_count += 1;
+                }
+                // 'H' 开头但既不是 H: 也不是 HM:（用户键名）→ 不计数但仍要 next
+                rocksdb.rocksdb_iter_next(it);
+            }
+        }
+        log.info("Dry run result: would migrate {d} hash data keys + {d} hash meta keys", .{ data_count, meta_count });
+        return;
+    }
+
+    const result = try db.migrateHashPrefix(allocator);
+    log.info("Migration complete: {d} hash data keys + {d} hash meta keys", .{ result.data_keys, result.meta_keys });
 }

@@ -50,6 +50,7 @@ cp "$PROJECT_DIR/packaging/install.sh" "$STAGE_DIR/install.sh"
 cp "$PROJECT_DIR/packaging/uninstall.sh" "$STAGE_DIR/uninstall.sh"
 cp "$PROJECT_DIR/packaging/novelkv.service" "$STAGE_DIR/novelkv.service"
 cp "$PROJECT_DIR/packaging/novelkv.conf" "$STAGE_DIR/novelkv.conf"
+cp "$PROJECT_DIR/packaging/novelkv.env" "$STAGE_DIR/novelkv.env"
 cp "$PROJECT_DIR/packaging/README.deploy.md" "$STAGE_DIR/README.md"
 chmod +x "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh"
 

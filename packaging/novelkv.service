@@ -2,6 +2,8 @@
 Description=NovelKV - High-performance text KV storage
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -11,17 +13,15 @@ Group=novelkv
 ExecStart=__BIN_PATH__ --config /etc/novelkv/novelkv.conf $NOVELKV_OPTS
 EnvironmentFile=-/etc/novelkv/novelkv.env
 
-WorkingDirectory=/var/lib/novelkv
+WorkingDirectory=__DATA_DIR__
 
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
 
 LimitNOFILE=65535
 
 ProtectSystem=strict
-ReadWritePaths=/var/lib/novelkv /var/log/novelkv
+ReadWritePaths=__DATA_DIR__ /var/log/novelkv
 ProtectHome=true
 NoNewPrivileges=true
 PrivateTmp=true

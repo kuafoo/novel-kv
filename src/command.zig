@@ -18,6 +18,12 @@ pub const ClientState = struct {
     needs_fullsync: bool = false,
     replica_port: u16 = 0,
     is_replication_apply: bool = false,
+    resp_version: u8 = 2, // 2=RESP2 (default), 3=RESP3 (negotiated via HELLO 3)
+};
+
+pub const KVPair = struct {
+    k: []const u8,
+    v: []const u8,
 };
 
 /// 命令执行结果，携带类型标签以便 RESP 层正确序列化。
@@ -31,6 +37,7 @@ pub const CommandResult = union(enum) {
     nil: void,
     null_array: void,
     array: ?[]const CommandResult,
+    map_pairs: ?[]const KVPair,
 };
 
 const CmdFn = *const fn (*storage.Database, std.mem.Allocator, []resp.RespValue, *ClientState) CommandResult;
@@ -86,6 +93,9 @@ const cmd_table = std.StaticStringMap(CmdFn).initComptime(.{
     .{ "hvals", &cmdHVals },
     .{ "replconf", &cmdReplconf },
     .{ "psync", &cmdPsync },
+    .{ "client", &cmdClient },
+    .{ "hello", &cmdHello },
+    .{ "reset", &cmdReset },
 });
 
 /// 命令执行入口：查找命令处理函数，依次检查禁用列表和认证状态。
@@ -104,11 +114,15 @@ pub fn execute(db: *storage.Database, allocator: std.mem.Allocator, args: []resp
         return CommandResult{ .error_msg = "ERR unknown command" };
     }
 
-    // 设置了密码时，除 AUTH/QUIT 外的命令必须先通过认证
+    // 设置了密码时，除 AUTH/QUIT/CLIENT/HELLO/RESET 外的命令必须先通过认证
+    // CLIENT 和 HELLO 是 redis-py 7.x+、Jedis、Lettuce、ioredis 握手时发送的命令
     if (db.password) |_| {
         if (!client.authenticated and
             !std.mem.eql(u8, cmd, "auth") and
-            !std.mem.eql(u8, cmd, "quit"))
+            !std.mem.eql(u8, cmd, "quit") and
+            !std.mem.eql(u8, cmd, "client") and
+            !std.mem.eql(u8, cmd, "hello") and
+            !std.mem.eql(u8, cmd, "reset"))
         {
             return CommandResult{ .error_msg = "NOAUTH Authentication required" };
         }
@@ -197,12 +211,149 @@ fn cmdAuth(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
     return CommandResult{ .error_msg = "ERR invalid password" };
 }
 
+// CLIENT 命令：仅支持 redis-py / Lettuce / Jedis 握手所需的子命令。
+// SETINFO / SETNAME / SETNAME 静默接受；GETNAME 返回 nil；ID 返回固定值；其他返回 OK 兼容。
+fn cmdClient(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    _ = db;
+    _ = allocator;
+    _ = client;
+    if (args.len < 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'client' command" };
+    var sub_buf: [16]u8 = undefined;
+    const sub = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR wrong number of arguments for 'client' command" };
+    if (sub.len > sub_buf.len) return CommandResult{ .simple_string = "OK" };
+    const sub_lower = std.ascii.lowerString(&sub_buf, sub);
+    if (std.mem.eql(u8, sub_lower, "setinfo") or std.mem.eql(u8, sub_lower, "setname")) {
+        return CommandResult{ .simple_string = "OK" };
+    }
+    if (std.mem.eql(u8, sub_lower, "getname")) {
+        return CommandResult{ .nil = {} };
+    }
+    if (std.mem.eql(u8, sub_lower, "id")) {
+        return CommandResult{ .integer = 1 };
+    }
+    if (std.mem.eql(u8, sub_lower, "info") or std.mem.eql(u8, sub_lower, "list")) {
+        return CommandResult{ .owned_string = "" };
+    }
+    if (std.mem.eql(u8, sub_lower, "no-evict") or std.mem.eql(u8, sub_lower, "no-touch") or std.mem.eql(u8, sub_lower, "reply")) {
+        return CommandResult{ .simple_string = "OK" };
+    }
+    if (std.mem.eql(u8, sub_lower, "pause") or std.mem.eql(u8, sub_lower, "unpause")) {
+        return CommandResult{ .simple_string = "OK" };
+    }
+    return CommandResult{ .simple_string = "OK" };
+}
+
+// HELLO 命令：协议协商。
+// - HELLO 2 [AUTH user pass]：返回 RESP2 数组 [k, v, k, v, ...]
+// - HELLO 3 [AUTH user pass]：切换连接为 RESP3，返回 RESP3 map
+//   redis-py 8.0+ 默认 HELLO 3 且无 NOPROTO 回退，必须成功返回才能完成握手
+fn cmdHello(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    var proto: u8 = 2;
+    if (args.len >= 2) {
+        const ver_str = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "NOPROTO unsupported protocol version" };
+        var ver_buf: [4]u8 = undefined;
+        if (ver_str.len > ver_buf.len) return CommandResult{ .error_msg = "NOPROTO unsupported protocol version" };
+        const v = std.ascii.lowerString(&ver_buf, ver_str);
+        if (std.mem.eql(u8, v, "2")) {
+            proto = 2;
+        } else if (std.mem.eql(u8, v, "3")) {
+            proto = 3;
+        } else {
+            return CommandResult{ .error_msg = "NOPROTO unsupported protocol version" };
+        }
+    }
+
+    // 解析可选 AUTH user pass / SETNAME name
+    var i: usize = 2;
+    while (i < args.len) {
+        const opt = getStringArg(args, i) orelse break;
+        var opt_buf: [8]u8 = undefined;
+        if (opt.len > opt_buf.len) break;
+        const opt_lower = std.ascii.lowerString(&opt_buf, opt);
+        if (std.mem.eql(u8, opt_lower, "auth")) {
+            const user_or_pass = getStringArg(args, i + 1) orelse return CommandResult{ .error_msg = "ERR Syntax error in HELLO" };
+            const password = db.password orelse return CommandResult{ .error_msg = "ERR Client sent AUTH, but no password is set" };
+            const maybe_pass = getStringArg(args, i + 2);
+            if (maybe_pass) |p| {
+                if (!std.mem.eql(u8, p, password)) return CommandResult{ .error_msg = "WRONGPASS invalid username-password pair or user is disabled" };
+                i += 3;
+            } else {
+                if (!std.mem.eql(u8, user_or_pass, password)) return CommandResult{ .error_msg = "WRONGPASS invalid username-password pair or user is disabled" };
+                i += 2;
+            }
+            client.authenticated = true;
+        } else if (std.mem.eql(u8, opt_lower, "setname")) {
+            if (getStringArg(args, i + 1) == null) return CommandResult{ .error_msg = "ERR Syntax error in HELLO" };
+            i += 2;
+        } else {
+            break;
+        }
+    }
+
+    // 握手成功，记录协议版本（后续 writeResult 据此切换 wire 格式）
+    client.resp_version = proto;
+
+    return makeHelloReply(allocator, proto);
+}
+
+fn makeHelloReply(allocator: std.mem.Allocator, proto: u8) CommandResult {
+    const proto_str = if (proto == 3) "3" else "2";
+    const pairs = [_]struct { k: []const u8, v: []const u8 }{
+        .{ .k = "server", .v = "novelkv" },
+        .{ .k = "version", .v = build_options.version },
+        .{ .k = "proto", .v = proto_str },
+        .{ .k = "id", .v = "1" },
+        .{ .k = "mode", .v = "standalone" },
+        .{ .k = "role", .v = "master" },
+        .{ .k = "modules", .v = "" },
+    };
+    var arr = allocator.alloc(KVPair, pairs.len) catch return CommandResult{ .error_msg = "ERR out of memory" };
+    for (pairs, 0..) |p, idx| {
+        const k = allocator.dupe(u8, p.k) catch {
+            for (arr[0..idx]) |q| {
+                allocator.free(q.k);
+                allocator.free(q.v);
+            }
+            allocator.free(arr);
+            return CommandResult{ .error_msg = "ERR out of memory" };
+        };
+        const v = allocator.dupe(u8, p.v) catch {
+            allocator.free(k);
+            for (arr[0..idx]) |q| {
+                allocator.free(q.k);
+                allocator.free(q.v);
+            }
+            allocator.free(arr);
+            return CommandResult{ .error_msg = "ERR out of memory" };
+        };
+        arr[idx] = .{ .k = k, .v = v };
+    }
+    return CommandResult{ .map_pairs = arr };
+}
+
+// RESET 命令：连接重置（redis-py 7.x 偶尔发送）。返回 +RESET。
+fn cmdReset(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
+    _ = db;
+    _ = allocator;
+    _ = args;
+    client.db_index = 0;
+    client.authenticated = false;
+    return CommandResult{ .simple_string = "RESET" };
+}
+
 // ============================================================
 // 基础读写命令
 // ============================================================
 
 fn cmdGet(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
     const key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR wrong number of arguments for 'get' command" };
+
+    // 类型检查：对 hash 调用 GET 应返回 WRONGTYPE
+    switch (checkHashType(db, allocator, key, client.db_index)) {
+        .is_hash => return CommandResult{ .error_msg = WRONGTYPE },
+        else => {},
+    }
+
     const val = db.get(key, client.db_index) catch return CommandResult{ .error_msg = "ERR read failed" };
     if (val) |v| {
         // RocksDB 返回的值需要拷贝后释放，owned_string 由 freeResult 释放
@@ -269,32 +420,62 @@ fn cmdSet(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Resp
 }
 
 fn cmdDel(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
-    _ = allocator;
     if (args.len < 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'del' command" };
     var count: i64 = 0;
     for (1..args.len) |i| {
         const key = getStringArg(args, i) orelse continue;
+
+        // 先检查 string key
         const existing = db.get(key, client.db_index) catch continue;
         if (existing) |v| {
             storage.freeValue(v);
             db.delete(key, client.db_index) catch continue;
             count += 1;
-        } else {
-            db.delete(key, client.db_index) catch {};
+            continue;
+        }
+
+        // 不是 string：检查是否是 hash（HM:<key> meta 是否存在）
+        const meta_key = hashMetaKey(allocator, key) catch continue;
+        defer allocator.free(meta_key);
+        const meta_val = db.get(meta_key, client.db_index) catch continue;
+        if (meta_val) |mv| {
+            storage.freeValue(mv);
+            // 是 hash：扫描并删除所有字段（H:<key>:*），再删除 meta
+            const prefix = hashFieldPrefix(allocator, key) catch continue;
+            defer allocator.free(prefix);
+            const fields = db.scanKeys(allocator, prefix, client.db_index, 0) catch continue;
+            defer {
+                for (fields) |f| allocator.free(f);
+                allocator.free(fields);
+            }
+            for (fields) |f| db.delete(f, client.db_index) catch {};
+            db.delete(meta_key, client.db_index) catch {};
+            count += 1;
         }
     }
     return CommandResult{ .integer = count };
 }
 
 fn cmdExists(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
-    _ = allocator;
     if (args.len < 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'exists' command" };
     var count: i64 = 0;
     for (1..args.len) |i| {
         const key = getStringArg(args, i) orelse continue;
+
+        // 检查 string key
         const val = db.get(key, client.db_index) catch continue;
         if (val) |v| {
             storage.freeValue(v);
+            count += 1;
+            continue;
+        }
+
+        // 检查 hash（HM:<key> meta 是否存在）
+        const meta_key = hashMetaKey(allocator, key) catch continue;
+        defer allocator.free(meta_key);
+        const meta_val = db.get(meta_key, client.db_index) catch continue;
+        if (meta_val) |mv| {
+            storage.freeValue(mv);
             count += 1;
         }
     }
@@ -661,7 +842,7 @@ fn cmdInfo(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
         if (std.mem.eql(u8, section, "stats")) {
             const cache = db.getCacheStats();
             const cf_stats = db.getCFStats(client.db_index);
-            const key_count = db.estimateKeyCount(client.db_index);
+            const key_count = db.userKeyCount(client.db_index);
             const info = std.fmt.allocPrint(allocator,
                 "# Stats\r\ntotal_commands_processed:{d}\r\ntotal_reads:{d}\r\ntotal_writes:{d}\r\ndb{d}_keys:{d}\r\ndb{d}_sst_files:{d}\r\ndb{d}_sst_size_bytes:{d}\r\nblock_cache_usage:{d}\r\nblock_cache_capacity:{d}\r\n",
                 .{ total_cmds, total_reads, total_writes, client.db_index, key_count, client.db_index, cf_stats.live_sst_files, client.db_index, cf_stats.live_sst_size, cache.usage, cache.capacity },
@@ -691,7 +872,7 @@ fn cmdInfo(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
     // Default: all sections
     const cache = db.getCacheStats();
     const cf_stats = db.getCFStats(client.db_index);
-    const key_count = db.estimateKeyCount(client.db_index);
+    const key_count = db.userKeyCount(client.db_index);
     const comp = db.getCompressionStats(client.db_index);
     const ks = db.getKeyspaceInfo(allocator) catch "";
     defer allocator.free(ks);
@@ -735,7 +916,7 @@ fn cmdConfig(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.R
 fn cmdDbsize(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
     _ = args;
     _ = allocator;
-    const count = db.estimateKeyCount(client.db_index);
+    const count = db.userKeyCount(client.db_index);
     return CommandResult{ .integer = @intCast(count) };
 }
 
@@ -767,13 +948,24 @@ fn cmdFlushall(db: *storage.Database, allocator: std.mem.Allocator, args: []resp
 // ============================================================
 
 fn cmdType(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.RespValue, client: *ClientState) CommandResult {
-    _ = allocator;
     const key = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR wrong number of arguments for 'type' command" };
+
+    // 先检查 string
     const val = db.get(key, client.db_index) catch return CommandResult{ .simple_string = "none" };
     if (val) |v| {
         storage.freeValue(v);
         return CommandResult{ .simple_string = "string" };
     }
+
+    // 再检查 hash（HM:<key> meta 是否存在）
+    const meta_key = hashMetaKey(allocator, key) catch return CommandResult{ .simple_string = "none" };
+    defer allocator.free(meta_key);
+    const meta_val = db.get(meta_key, client.db_index) catch return CommandResult{ .simple_string = "none" };
+    if (meta_val) |mv| {
+        storage.freeValue(mv);
+        return CommandResult{ .simple_string = "hash" };
+    }
+
     return CommandResult{ .simple_string = "none" };
 }
 
@@ -968,21 +1160,29 @@ fn cmdKeys(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.Res
     if (args.len < 2) return CommandResult{ .error_msg = "ERR wrong number of arguments for 'keys' command" };
     const pattern = getStringArg(args, 1) orelse return CommandResult{ .error_msg = "ERR invalid pattern" };
 
-    // 无通配符的精确匹配请求使用前缀优化
-    const keys = db.scanKeys(allocator, "", client.db_index, 0) catch
+    // 扫描所有原始 key（含内部前缀），由 exposeUserKey 决定如何展示
+    const raw_keys = db.scanKeys(allocator, "", client.db_index, 0) catch
         return CommandResult{ .error_msg = "ERR scan failed" };
 
-    var matched = std.ArrayList([]const u8).initCapacity(allocator, keys.len) catch
+    var matched = std.ArrayList([]const u8).initCapacity(allocator, raw_keys.len) catch
         return CommandResult{ .error_msg = "ERR out of memory" };
 
-    for (keys) |k| {
-        if (globMatch(pattern, k)) {
-            matched.appendAssumeCapacity(k);
-        } else {
-            allocator.free(k);
+    for (raw_keys) |k| {
+        // __novelkv:meta: 和 H: 跳过；HM:<userkey> 转换为 <userkey>
+        if (storage.Database.exposeUserKey(k)) |user_key| {
+            const user_key_duped = allocator.dupe(u8, user_key) catch {
+                allocator.free(k);
+                continue;
+            };
+            if (globMatch(pattern, user_key_duped)) {
+                matched.appendAssumeCapacity(user_key_duped);
+            } else {
+                allocator.free(user_key_duped);
+            }
         }
+        allocator.free(k);
     }
-    allocator.free(keys);
+    allocator.free(raw_keys);
 
     const results = allocator.alloc(CommandResult, matched.items.len) catch return CommandResult{ .error_msg = "ERR out of memory" };
     for (matched.items, 0..) |k, idx| {
@@ -1032,12 +1232,13 @@ fn globMatchRecursive(pattern: []const u8, pi: usize, text: []const u8, ti: usiz
 
 // ============================================================
 // Hash 命令（Meta + Data 双 key）
-// Meta: "HM:{key}" → varint(field_count)
-// Data: "H:{key}:{field}" → value
+// Meta: "__novelkv:hm:{key}" → ASCII field count
+// Data: "__novelkv:h:{key}:{field}" → value
+// 长前缀避免与用户键名冲突（用户键名可以任意以 H:/HM: 开头）
 // ============================================================
 
-const HASH_DATA_PREFIX = "H:";
-const HASH_META_PREFIX = "HM:";
+const HASH_DATA_PREFIX = "__novelkv:h:";
+const HASH_META_PREFIX = "__novelkv:hm:";
 const WRONGTYPE = "WRONGTYPE Operation against a key holding the wrong kind of value";
 
 fn hashFieldKey(allocator: std.mem.Allocator, hash_key: []const u8, field: []const u8) ![]const u8 {
@@ -1289,6 +1490,39 @@ fn cmdHGetAll(db: *storage.Database, allocator: std.mem.Allocator, args: []resp.
 
     const kvs = db.scanKeyValues(allocator, prefix, client.db_index, 0) catch
         return CommandResult{ .error_msg = "ERR scan failed" };
+
+    // RESP3 HGETALL 应返回 map，RESP2 返回 [k, v, k, v, ...] 数组
+    if (client.resp_version == 3) {
+        const pairs = allocator.alloc(KVPair, kvs.len) catch {
+            for (kvs) |kv| {
+                allocator.free(kv.key);
+                allocator.free(kv.value);
+            }
+            allocator.free(kvs);
+            return CommandResult{ .error_msg = "ERR out of memory" };
+        };
+        for (kvs, 0..) |kv, i| {
+            pairs[i] = .{
+                .k = allocator.dupe(u8, extractFieldName(prefix, kv.key)) catch {
+                    for (pairs[0..i]) |p| {
+                        allocator.free(p.k);
+                        allocator.free(p.v);
+                    }
+                    allocator.free(pairs);
+                    for (kvs[i..]) |k2| {
+                        allocator.free(k2.key);
+                        allocator.free(k2.value);
+                    }
+                    allocator.free(kvs);
+                    return CommandResult{ .error_msg = "ERR out of memory" };
+                },
+                .v = kv.value,
+            };
+            allocator.free(kv.key);
+        }
+        allocator.free(kvs);
+        return CommandResult{ .map_pairs = pairs };
+    }
 
     const results = allocator.alloc(CommandResult, kvs.len * 2) catch return CommandResult{ .error_msg = "ERR out of memory" };
     for (kvs, 0..) |kv, i| {

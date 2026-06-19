@@ -104,7 +104,7 @@ fn handleConnectionInner(io: std.Io, allocator: std.mem.Allocator, db: *storage.
         }
 
         const result = command.execute(db, allocator, resp_args, &client);
-        writeResult(writer, allocator, result) catch {};
+        writeResult(writer, allocator, result, client.resp_version) catch {};
         freeResult(allocator, result);
         writer.flush() catch {};
 
@@ -188,7 +188,8 @@ fn drainLine(reader: *std.Io.Reader) !void {
 }
 
 /// 将命令执行结果序列化为 RESP 协议格式写入客户端
-fn writeResult(writer: *std.Io.Writer, allocator: std.mem.Allocator, result: command.CommandResult) !void {
+/// resp_version=3 时使用 RESP3 wire 格式（null 用 `_`，map 用 `%`）
+fn writeResult(writer: *std.Io.Writer, allocator: std.mem.Allocator, result: command.CommandResult, resp_version: u8) !void {
     switch (result) {
         .ok => {
             try resp.writeSimpleString(writer, "OK");
@@ -203,28 +204,53 @@ fn writeResult(writer: *std.Io.Writer, allocator: std.mem.Allocator, result: com
             if (maybe_val) |val| {
                 try resp.writeBulkString(writer, val);
             } else {
-                try writer.writeAll("$-1\r\n");
+                try writeNull(writer, resp_version);
             }
         },
         .integer => |n| {
             try resp.writeInteger(writer, n);
         },
         .nil => {
-            try writer.writeAll("$-1\r\n");
+            try writeNull(writer, resp_version);
         },
         .null_array => {
-            try writer.writeAll("*-1\r\n");
+            try writeNull(writer, resp_version);
         },
         .array => |maybe_items| {
             if (maybe_items) |items| {
                 try writer.print("*{d}\r\n", .{items.len});
                 for (items) |item| {
-                    try writeResult(writer, allocator, item);
+                    try writeResult(writer, allocator, item, resp_version);
                 }
             } else {
-                try writer.writeAll("*-1\r\n");
+                try writeNull(writer, resp_version);
             }
         },
+        .map_pairs => |maybe_pairs| {
+            if (maybe_pairs) |pairs| {
+                // RESP3 用 map 前缀 `%`，RESP2 用数组前缀 `*` + 2N 项
+                if (resp_version == 3) {
+                    try writer.print("%{d}\r\n", .{pairs.len});
+                } else {
+                    try writer.print("*{d}\r\n", .{pairs.len * 2});
+                }
+                for (pairs) |p| {
+                    try resp.writeBulkString(writer, p.k);
+                    try resp.writeBulkString(writer, p.v);
+                }
+            } else {
+                try writeNull(writer, resp_version);
+            }
+        },
+    }
+}
+
+/// RESP2: $-1\r\n  RESP3: _\r\n
+fn writeNull(writer: *std.Io.Writer, resp_version: u8) !void {
+    if (resp_version == 3) {
+        try writer.writeAll("_\r\n");
+    } else {
+        try writer.writeAll("$-1\r\n");
     }
 }
 
@@ -243,6 +269,15 @@ fn freeResult(allocator: std.mem.Allocator, result: command.CommandResult) void 
                     freeResult(allocator, item);
                 }
                 allocator.free(items);
+            }
+        },
+        .map_pairs => |maybe_pairs| {
+            if (maybe_pairs) |pairs| {
+                for (pairs) |p| {
+                    allocator.free(p.k);
+                    allocator.free(p.v);
+                }
+                allocator.free(pairs);
             }
         },
     }

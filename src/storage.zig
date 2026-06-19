@@ -87,6 +87,8 @@ pub const Database = struct {
     start_time: i64 = 0, // epoch seconds
     /// Per-db total uncompressed value bytes (for accurate compression ratio)
     total_value_bytes: [16]std.atomic.Value(u64) = undefined,
+    /// Per-db user-visible key count (excludes internal keys: __novelkv:meta:, __novelkv:h:, __novelkv:hm:)
+    user_key_count: [16]std.atomic.Value(u64) = undefined,
     /// SCAN 数字游标映射
     scan_cursor_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     scan_cursor_lock: std.atomic.Mutex = .unlocked,
@@ -320,6 +322,7 @@ pub const Database = struct {
                 .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
             };
             for (&result.total_value_bytes) |*v| v.* = std.atomic.Value(u64).init(0);
+            for (&result.user_key_count) |*v| v.* = std.atomic.Value(u64).init(0);
             // New database, no calibration needed
             return result;
         }
@@ -360,9 +363,11 @@ pub const Database = struct {
             .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
         };
         for (&result.total_value_bytes) |*v| v.* = std.atomic.Value(u64).init(0);
+        for (&result.user_key_count) |*v| v.* = std.atomic.Value(u64).init(0);
         // Load persisted counters / calibrate from existing data
         for (0..MAX_DATABASES) |i| {
             result.calibrateTotalValueBytes(i);
+            result.calibrateUserKeyCount(i);
         }
         return result;
     }
@@ -438,7 +443,7 @@ pub const Database = struct {
             parts.deinit(allocator);
         }
         for (0..MAX_DATABASES) |i| {
-            const count = self.estimateKeyCount(i);
+            const count = self.userKeyCount(i);
             if (count > 0) {
                 const line = std.fmt.allocPrint(allocator, "db{d}:keys={d}\r\n", .{ i, count }) catch continue;
                 parts.appendAssumeCapacity(line);
@@ -475,12 +480,22 @@ pub const Database = struct {
     // ---- Internal meta key helpers (stored in db0 default CF) ----
 
     const META_KEY_PREFIX = "__novelkv:meta:db";
-    const META_KEY_SUFFIX = ":value_bytes";
+    const META_KEY_SUFFIX_VALUE_BYTES = ":value_bytes";
+    const META_KEY_SUFFIX_USER_COUNT = ":user_count";
 
-    fn metaKey(db_index: usize) [META_KEY_PREFIX.len + 3 + META_KEY_SUFFIX.len:0]u8 {
-        var buf: [META_KEY_PREFIX.len + 3 + META_KEY_SUFFIX.len:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&buf, "{s}{d:0>2}{s}", .{ META_KEY_PREFIX, db_index, META_KEY_SUFFIX }, 0) catch |err| {
+    fn metaKey(db_index: usize) [META_KEY_PREFIX.len + 3 + META_KEY_SUFFIX_VALUE_BYTES.len:0]u8 {
+        var buf: [META_KEY_PREFIX.len + 3 + META_KEY_SUFFIX_VALUE_BYTES.len:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&buf, "{s}{d:0>2}{s}", .{ META_KEY_PREFIX, db_index, META_KEY_SUFFIX_VALUE_BYTES }, 0) catch |err| {
             log.err("metaKey format failed: {}", .{err});
+            @memcpy(buf[0..2], "__");
+            buf[2] = 0;
+        };
+        return buf;
+    }
+
+    fn userCountMetaKey(buf: *[@as(usize, META_KEY_PREFIX.len) + 3 + META_KEY_SUFFIX_USER_COUNT.len:0]u8, db_index: usize) [:0]u8 {
+        _ = std.fmt.bufPrintSentinel(buf, "{s}{d:0>2}{s}", .{ META_KEY_PREFIX, db_index, META_KEY_SUFFIX_USER_COUNT }, 0) catch |err| {
+            log.err("userCountMetaKey format failed: {}", .{err});
             @memcpy(buf[0..2], "__");
             buf[2] = 0;
         };
@@ -510,11 +525,51 @@ pub const Database = struct {
         }
     }
 
+    fn persistUserKeyCount(self: *Database, db_index: usize) void {
+        var key_buf: [META_KEY_PREFIX.len + 3 + META_KEY_SUFFIX_USER_COUNT.len:0]u8 = undefined;
+        const key = userCountMetaKey(&key_buf, db_index);
+        const value = self.user_key_count[db_index].load(.monotonic);
+        if (value == 0) {
+            var err: [*c]u8 = null;
+            rocksdb.rocksdb_delete_cf(self.db, self.write_options, self.cf_handles[0], key.ptr, key.len, &err);
+            if (err) |e| {
+                log.warn("failed to delete user_count meta key for db{d}: {s}", .{ db_index, e });
+                rocksdb.rocksdb_free(e);
+            }
+            return;
+        }
+        var buf: [20]u8 = undefined;
+        const val_str = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
+        var err: [*c]u8 = null;
+        rocksdb.rocksdb_put_cf(self.db, self.write_options, self.cf_handles[0], key.ptr, key.len, val_str.ptr, val_str.len, &err);
+        if (err) |e| {
+            log.warn("failed to persist user_count meta key for db{d}: {s}", .{ db_index, e });
+            rocksdb.rocksdb_free(e);
+        }
+    }
+
     fn loadTotalValueBytes(self: *Database, db_index: usize) u64 {
         const key = metaKey(db_index);
         var val_len: usize = 0;
         var err: [*c]u8 = null;
         const val = rocksdb.rocksdb_get_cf(self.db, self.read_options, self.cf_handles[0], &key, key.len, &val_len, &err);
+        if (err) |e| {
+            rocksdb.rocksdb_free(e);
+            return 0;
+        }
+        if (val) |v| {
+            defer rocksdb.rocksdb_free(v);
+            return std.fmt.parseInt(u64, v[0..val_len], 10) catch 0;
+        }
+        return 0;
+    }
+
+    fn loadUserKeyCount(self: *Database, db_index: usize) u64 {
+        var key_buf: [META_KEY_PREFIX.len + 3 + META_KEY_SUFFIX_USER_COUNT.len:0]u8 = undefined;
+        const key = userCountMetaKey(&key_buf, db_index);
+        var val_len: usize = 0;
+        var err: [*c]u8 = null;
+        const val = rocksdb.rocksdb_get_cf(self.db, self.read_options, self.cf_handles[0], key.ptr, key.len, &val_len, &err);
         if (err) |e| {
             rocksdb.rocksdb_free(e);
             return 0;
@@ -562,6 +617,24 @@ pub const Database = struct {
         self.total_value_bytes[db_index].store(total, .monotonic);
         self.persistTotalValueBytes(db_index);
         log.info("db{d}: calibrated total_value_bytes = {d} ({d} keys)", .{ db_index, total, count });
+    }
+
+    /// 启动校准：如果 user_key_count 为 0 但 db 有数据，遍历统计真实 key 数
+    fn calibrateUserKeyCount(self: *Database, db_index: usize) void {
+        const saved = self.loadUserKeyCount(db_index);
+        if (saved > 0) {
+            self.user_key_count[db_index].store(saved, .monotonic);
+            log.info("db{d}: loaded user_key_count = {d} from meta key", .{ db_index, saved });
+            return;
+        }
+        const estimate = self.estimateKeyCount(db_index);
+        if (estimate == 0) return;
+        // Calibrate from scratch by counting non-internal keys
+        log.info("db{d}: calibrating user_key_count (upgrade from old version)...", .{db_index});
+        const actual = self.actualKeyCount(db_index);
+        self.user_key_count[db_index].store(actual, .monotonic);
+        self.persistUserKeyCount(db_index);
+        log.info("db{d}: calibrated user_key_count = {d}", .{ db_index, actual });
     }
 
     /// 单 key 读取
@@ -669,6 +742,13 @@ pub const Database = struct {
         _ = self.total_value_bytes[db_index].fetchAdd(value.len, .monotonic);
         if (old_len > 0) _ = self.total_value_bytes[db_index].fetchSub(old_len, .monotonic);
         self.persistTotalValueBytes(db_index);
+
+        // 用户可见 key 计数：新 key (old_len==0) 且非内部 key 时 +1
+        // __novelkv:hm: 前缀代表 hash 元数据（每个 hash 算 1 个 key），__novelkv:h: 前缀是 hash 字段（不计入）
+        if (old_len == 0 and isCountedAsUserKey(key)) {
+            _ = self.user_key_count[db_index].fetchAdd(1, .monotonic);
+            self.persistUserKeyCount(db_index);
+        }
     }
 
     /// Merge 操作：将 value 追加到 key 的现有值末尾（由 Merge Operator 处理）
@@ -715,6 +795,12 @@ pub const Database = struct {
 
         if (old_len > 0) _ = self.total_value_bytes[db_index].fetchSub(old_len, .monotonic);
         self.persistTotalValueBytes(db_index);
+
+        // 用户可见 key 计数：删除存在的 key 且非内部 key 时 -1
+        if (old_len > 0 and isCountedAsUserKey(key)) {
+            _ = self.user_key_count[db_index].fetchSub(1, .monotonic);
+            self.persistUserKeyCount(db_index);
+        }
     }
 
     pub fn estimateKeyCount(self: *Database, db_index: usize) u64 {
@@ -723,6 +809,11 @@ pub const Database = struct {
         const rc = rocksdb.rocksdb_property_int_cf(self.db, cf, "rocksdb.estimate-num-keys", &result);
         _ = rc;
         return result;
+    }
+
+    /// 用户可见 key 计数（O(1)，原子读取，排除内部 key）
+    pub fn userKeyCount(self: *Database, db_index: usize) u64 {
+        return self.user_key_count[db_index].load(.monotonic);
     }
 
     /// 获取 Block Cache 命中率统计
@@ -755,6 +846,8 @@ pub const Database = struct {
     pub fn flushDatabase(self: *Database, db_index: usize) !void {
         self.total_value_bytes[db_index].store(0, .monotonic);
         self.persistTotalValueBytes(db_index);
+        self.user_key_count[db_index].store(0, .monotonic);
+        self.persistUserKeyCount(db_index);
         if (db_index == 0) {
             const cf = self.cf_handles[0];
             var err: [*c]u8 = null;
@@ -851,6 +944,9 @@ pub const Database = struct {
                 }
             }
 
+            // 注意：scanKeys 不在此处过滤内部 key（H:/HM:/__novelkv:meta:）。
+            // 调用方决定如何处理（HKEYS 直接用 prefix 扫描 hash 字段；KEYS 在
+            // command.zig 中应用 exposeUserKey 转换/过滤）。
             const duped = allocator.dupe(u8, key[0..key_len]) catch break;
             keys.append(allocator, duped) catch {
                 allocator.free(duped);
@@ -913,12 +1009,9 @@ pub const Database = struct {
         const iter = rocksdb.rocksdb_create_iterator_cf(self.db, self.read_options, cf);
         defer rocksdb.rocksdb_iter_destroy(iter);
 
+        // start_key 是上一轮的 next_key（即下一批的第一个 key），不跳过
         if (start_key) |sk| {
             rocksdb.rocksdb_iter_seek(iter, sk.ptr, sk.len);
-            // 跳过 cursor 自身（它是上一轮最后一个 key）
-            if (rocksdb.rocksdb_iter_valid(iter) != 0) {
-                rocksdb.rocksdb_iter_next(iter);
-            }
         } else {
             rocksdb.rocksdb_iter_seek_to_first(iter);
         }
@@ -926,33 +1019,187 @@ pub const Database = struct {
         var keys = std.ArrayList([]const u8).initCapacity(allocator, @min(limit, 256)) catch
             return .{ .keys = &.{}, .next_key = null };
 
+        // 应用 exposeUserKey：HM:<userkey> 转换为 <userkey>（hash 键可见，与 Redis 一致）；
+        // __novelkv:meta:* 和 H:（hash 字段）跳过。
         while (rocksdb.rocksdb_iter_valid(iter) != 0 and keys.items.len < limit) {
             var key_len: usize = 0;
             const key = rocksdb.rocksdb_iter_key(iter, &key_len);
             if (key_len == 0) break;
 
-            const duped = allocator.dupe(u8, key[0..key_len]) catch break;
-            keys.append(allocator, duped) catch {
-                allocator.free(duped);
-                break;
-            };
+            if (exposeUserKey(key[0..key_len])) |user_key| {
+                const duped = allocator.dupe(u8, user_key) catch break;
+                keys.append(allocator, duped) catch {
+                    allocator.free(duped);
+                    break;
+                };
+            }
             rocksdb.rocksdb_iter_next(iter);
         }
 
-        // 如果迭代器还有数据，取当前 key 作为下一轮 cursor
+        // 取下一个非隐藏 key 作为下一轮 cursor 起点（保留原始 RocksDB key 用于 seek）
         var next_key: ?[]const u8 = null;
-        if (rocksdb.rocksdb_iter_valid(iter) != 0) {
+        while (rocksdb.rocksdb_iter_valid(iter) != 0) {
             var nk_len: usize = 0;
             const nk = rocksdb.rocksdb_iter_key(iter, &nk_len);
-            if (nk_len > 0) {
+            if (nk_len == 0) break;
+            if (exposeUserKey(nk[0..nk_len]) != null) {
                 next_key = allocator.dupe(u8, nk[0..nk_len]) catch null;
+                break;
             }
+            rocksdb.rocksdb_iter_next(iter);
         }
 
         return .{
             .keys = keys.toOwnedSlice(allocator) catch &.{},
             .next_key = next_key,
         };
+    }
+
+    /// 判断 key 是否为内部 key（不应原样暴露给用户的 SCAN/KEYS 结果）
+    /// - `__novelkv:meta:` 是持久化的字节计数器
+    /// - `__novelkv:h:` 是 hash 字段数据
+    /// - `__novelkv:hm:` 是 hash 元数据
+    pub fn isInternalKey(key: []const u8) bool {
+        if (key.len >= 15 and std.mem.eql(u8, key[0..15], "__novelkv:meta:")) return true;
+        if (key.len >= 12 and std.mem.eql(u8, key[0..12], "__novelkv:h:")) return true;
+        if (key.len >= 13 and std.mem.eql(u8, key[0..13], "__novelkv:hm:")) return true;
+        return false;
+    }
+
+    /// 将内部 RocksDB key 转换为用户可见 key（SCAN/KEYS 返回值）。
+    /// - `__novelkv:meta:*` 返回 null（隐藏，不暴露）
+    /// - `__novelkv:hm:<userkey>` 返回 `<userkey>`（hash 键暴露给用户，与 Redis 行为一致）
+    /// - `__novelkv:h:<rest>` 返回 null（hash 字段，hash 内部细节）
+    /// - 其他原样返回（包括用户键名以 H:/HM: 开头的情况）
+    /// 返回的 slice 是入参的子切片，未分配内存。
+    pub fn exposeUserKey(key: []const u8) ?[]const u8 {
+        if (key.len >= 15 and std.mem.eql(u8, key[0..15], "__novelkv:meta:")) return null;
+        if (key.len >= 13 and std.mem.eql(u8, key[0..13], "__novelkv:hm:")) return key[13..];
+        if (key.len >= 12 and std.mem.eql(u8, key[0..12], "__novelkv:h:")) return null;
+        return key;
+    }
+
+    /// 判断 key 是否应计入用户可见 key 计数
+    /// - `__novelkv:meta:` 不计入（内部计数器）
+    /// - `__novelkv:h:` 不计入（hash 字段，属 hash 内部）
+    /// - `__novelkv:hm:` 计入（每个 hm: 代表一个用户可见的 hash key）
+    /// - 其他（字符串 key 等）计入，包括用户键名以 H:/HM: 开头的情况
+    pub fn isCountedAsUserKey(key: []const u8) bool {
+        if (key.len >= 15 and std.mem.eql(u8, key[0..15], "__novelkv:meta:")) return false;
+        if (key.len >= 12 and std.mem.eql(u8, key[0..12], "__novelkv:h:")) return false;
+        return true;
+    }
+
+    /// 精确计数用户可见 key（__novelkv:hm: 计入，__novelkv:h: 和 __novelkv:meta: 不计入）。
+    /// 代价：全表迭代，5M keys ~1-2 秒。用于启动校准。
+    pub fn actualKeyCount(self: *Database, db_index: usize) u64 {
+        const cf = self.cf_handles[db_index];
+        const iter = rocksdb.rocksdb_create_iterator_cf(self.db, self.read_options, cf);
+        defer rocksdb.rocksdb_iter_destroy(iter);
+
+        rocksdb.rocksdb_iter_seek_to_first(iter);
+        var count: u64 = 0;
+        while (rocksdb.rocksdb_iter_valid(iter) != 0) {
+            var key_len: usize = 0;
+            const key = rocksdb.rocksdb_iter_key(iter, &key_len);
+            if (key_len == 0) break;
+            if (isCountedAsUserKey(key[0..key_len])) {
+                count +%= 1;
+            }
+            rocksdb.rocksdb_iter_next(iter);
+        }
+        return count;
+    }
+
+    /// 一次性迁移：将旧 hash 前缀 (`H:` / `HM:`) 重写为新前缀
+    /// (`__novelkv:h:` / `__novelkv:hm:`)，用于版本升级路径。
+    /// 必须在 NovelKV 服务未运行时调用（独占数据库）。
+    /// 返回迁移的 hash 字段数和 hash 元数据数。
+    pub fn migrateHashPrefix(self: *Database, allocator: std.mem.Allocator) !struct { data_keys: u64, meta_keys: u64 } {
+        var total_data: u64 = 0;
+        var total_meta: u64 = 0;
+
+        for (0..MAX_DATABASES) |db_index| {
+            const cf = self.cf_handles[db_index];
+            const iter = rocksdb.rocksdb_create_iterator_cf(self.db, self.read_options, cf);
+            defer rocksdb.rocksdb_iter_destroy(iter);
+
+            // 先收集所有旧前缀 (key, value)，避免在 iter 进行中写入造成的不一致
+            var collected: std.ArrayList(KeyValue) = .empty;
+            defer {
+                for (collected.items) |kv| {
+                    allocator.free(kv.key);
+                    allocator.free(kv.value);
+                }
+                collected.deinit(allocator);
+            }
+
+            rocksdb.rocksdb_iter_seek(iter, "H:", 2);
+            while (rocksdb.rocksdb_iter_valid(iter) != 0) {
+                var key_len: usize = 0;
+                const key = rocksdb.rocksdb_iter_key(iter, &key_len);
+                // 不是 'H' 开头：扫描区间结束
+                if (key_len < 1 or key[0] != 'H') break;
+                // 'H' 开头但既不是 H: 也不是 HM:（用户键名恰好以 H 开头）→ 跳过
+                const is_h = (key_len >= 2 and key[1] == ':');
+                const is_hm = (key_len >= 3 and key[1] == 'M' and key[2] == ':');
+                if (!is_h and !is_hm) {
+                    rocksdb.rocksdb_iter_next(iter);
+                    continue;
+                }
+
+                var val_len: usize = 0;
+                const val = rocksdb.rocksdb_iter_value(iter, &val_len);
+
+                const key_dup = allocator.dupe(u8, key[0..key_len]) catch break;
+                errdefer allocator.free(key_dup);
+                const val_dup = allocator.dupe(u8, val[0..val_len]) catch {
+                    allocator.free(key_dup);
+                    break;
+                };
+                errdefer allocator.free(val_dup);
+                collected.append(allocator, .{ .key = key_dup, .value = val_dup }) catch {
+                    allocator.free(key_dup);
+                    allocator.free(val_dup);
+                    break;
+                };
+
+                rocksdb.rocksdb_iter_next(iter);
+            }
+
+            if (collected.items.len == 0) continue;
+
+            // 单 batch 写入：put 新 key + delete 旧 key
+            const batch = rocksdb.rocksdb_writebatch_create();
+            defer rocksdb.rocksdb_writebatch_destroy(batch);
+
+            for (collected.items) |kv| {
+                const is_hm = (kv.key.len >= 3 and kv.key[0] == 'H' and kv.key[1] == 'M' and kv.key[2] == ':');
+                const new_prefix: []const u8 = if (is_hm) "__novelkv:hm:" else "__novelkv:h:";
+                const tail_skip: usize = if (is_hm) 3 else 2;
+
+                const new_key = std.fmt.allocPrint(allocator, "{s}{s}", .{ new_prefix, kv.key[tail_skip..] }) catch return error.OutOfMemory;
+                defer allocator.free(new_key);
+
+                rocksdb.rocksdb_writebatch_put_cf(batch, cf, new_key.ptr, new_key.len, kv.value.ptr, kv.value.len);
+                rocksdb.rocksdb_writebatch_delete_cf(batch, cf, kv.key.ptr, kv.key.len);
+
+                if (is_hm) total_meta += 1 else total_data += 1;
+            }
+
+            var werr: [*c]u8 = null;
+            rocksdb.rocksdb_write(self.db, self.write_options, batch, &werr);
+            if (werr) |e| {
+                const msg = std.mem.sliceTo(e, 0);
+                log.err("Migration write failed on db{d}: {s}", .{ db_index, msg });
+                rocksdb.rocksdb_free(e);
+                return error.WriteFailed;
+            }
+
+            log.info("db{d}: migrated {d} hash keys", .{ db_index, collected.items.len });
+        }
+
+        return .{ .data_keys = total_data, .meta_keys = total_meta };
     }
 
     /// 获取压缩统计：原始数据估算 vs 压缩后 SST 大小
@@ -976,12 +1223,14 @@ pub const Database = struct {
         const cf = self.cf_handles[db_index];
         var err: [*c]u8 = null;
 
-        // Pre-fetch old value sizes for byte tracking
+        // Pre-fetch old value sizes for byte tracking + key count delta
         var delta: i64 = 0;
+        var key_count_delta: i64 = 0;
         for (pairs) |pair| {
             var val_len: usize = 0;
             var get_err: [*c]u8 = null;
             const old_val = rocksdb.rocksdb_get_cf(self.db, self.read_options, cf, pair.key.ptr, pair.key.len, &val_len, &get_err);
+            const was_existing = (old_val != null);
             if (get_err) |e| {
                 rocksdb.rocksdb_free(e);
             } else if (old_val) |v| {
@@ -989,6 +1238,11 @@ pub const Database = struct {
                 delta -= @as(i64, @intCast(val_len));
             }
             delta += @as(i64, @intCast(pair.value.len));
+
+            // 仅可计入用户 key 影响 user_key_count
+            if (isCountedAsUserKey(pair.key)) {
+                if (!was_existing) key_count_delta += 1;
+            }
         }
 
         const batch = rocksdb.rocksdb_writebatch_create();
@@ -1011,6 +1265,15 @@ pub const Database = struct {
             _ = self.total_value_bytes[db_index].fetchSub(@intCast(-delta), .monotonic);
         }
         self.persistTotalValueBytes(db_index);
+
+        if (key_count_delta != 0) {
+            if (key_count_delta > 0) {
+                _ = self.user_key_count[db_index].fetchAdd(@intCast(key_count_delta), .monotonic);
+            } else {
+                _ = self.user_key_count[db_index].fetchSub(@intCast(-key_count_delta), .monotonic);
+            }
+            self.persistUserKeyCount(db_index);
+        }
     }
 };
 

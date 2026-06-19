@@ -11,3 +11,15 @@ backups/
 package.json
 package-lock.json
 dist/
+.pytest_cache/
+
+# 性能/集成测试脚本含远程凭证，仅本地使用
+blocksize_test.py
+combo_test.py
+compress_test.py
+dict_compare_test.py
+local_compare_test.py
+migrate_test.py
+remote_compress_test.py
+stability_2h.py
+stability_5h.py

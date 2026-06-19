@@ -45,7 +45,7 @@ build_rocksdb() {
     local BUILD="$DL/rocksdb-11.1.1/build-zig"
     mkdir -p "$BUILD"
 
-    # Collect all .cc files excluding test/bench/tools/examples/fuzz
+    # Collect all .cc files excluding test/bench/tools/examples/fuzz/stress
     local SRCS=$(find "$SRC" -name "*.cc" \
         -not -path "*/test/*" \
         -not -path "*/bench*/*" \
@@ -53,6 +53,7 @@ build_rocksdb() {
         -not -path "*/examples/*" \
         -not -path "*/fuzz/*" \
         -not -path "*/unity/*" \
+        -not -path "*stress*" \
         -not -name "*test*" \
         -not -name "*bench*")
 
