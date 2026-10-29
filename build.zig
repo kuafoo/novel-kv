@@ -12,7 +12,8 @@ fn addDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarg
     mod.addObjectFile(b.path("deps/lib/librocksdb.a"));
     mod.addObjectFile(b.path("deps/lib/libzstd.a"));
     mod.addObjectFile(b.path("deps/lib/libsnappy.a"));
-    mod.linkSystemLibrary("stdc++", .{});
+    // deps/lib/*.a 由 zig c++ 针对 libc++ 编译（std::__1 内联命名空间），必须链接 libc++
+    mod.linkSystemLibrary("c++", .{});
     mod.linkSystemLibrary("pthread", .{});
     mod.linkSystemLibrary("dl", .{});
     mod.linkSystemLibrary("rt", .{});
@@ -54,9 +55,6 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 

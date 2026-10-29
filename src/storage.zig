@@ -64,7 +64,6 @@ pub const Database = struct {
     write_options: *rocksdb.rocksdb_writeoptions_t,
     disabled_commands: []const []const u8,
     password: ?[]const u8,
-    filter_policy: ?*rocksdb.rocksdb_filterpolicy_t,
     block_cache: ?*rocksdb.rocksdb_cache_t,
     /// 主端复制状态（仅主节点有值）
     repl: ?*replication.MasterState = null,
@@ -126,6 +125,7 @@ pub const Database = struct {
 
         // Bloom Filter：减少不存在的 key 的磁盘 I/O
         const filter_policy = rocksdb.rocksdb_filterpolicy_create_bloom(bloom_bits);
+        // set_filter_policy 内部 filter_policy.reset() 接管所有权，不可再 destroy
         rocksdb.rocksdb_block_based_options_set_filter_policy(block_opts, filter_policy);
 
         // LRU Block Cache：缓存热数据 block，避免重复磁盘读取
@@ -316,7 +316,6 @@ pub const Database = struct {
                 .write_options = write_options,
                 .disabled_commands = config.disabled_commands,
                 .password = config.password,
-                .filter_policy = filter_policy,
                 .block_cache = block_cache,
                 .start_time = start_time,
                 .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
@@ -357,7 +356,6 @@ pub const Database = struct {
             .write_options = write_options,
             .disabled_commands = config.disabled_commands,
             .password = config.password,
-            .filter_policy = filter_policy,
             .block_cache = block_cache,
             .start_time = start_time,
             .scan_cursor_map = std.AutoHashMap(u64, []const u8).init(allocator),
@@ -373,13 +371,13 @@ pub const Database = struct {
     }
 
     pub fn close(self: *Database) void {
-        rocksdb.rocksdb_close(self.db);
+        // CF handle 必须在 DB 之前销毁，否则 DB 关闭后访问已释放的 mutex
         for (&self.cf_handles) |*handle| {
             rocksdb.rocksdb_column_family_handle_destroy(handle.*);
         }
+        rocksdb.rocksdb_close(self.db);
         rocksdb.rocksdb_readoptions_destroy(self.read_options);
         rocksdb.rocksdb_writeoptions_destroy(self.write_options);
-        if (self.filter_policy) |fp| rocksdb.rocksdb_filterpolicy_destroy(fp);
         if (self.block_cache) |bc| rocksdb.rocksdb_cache_destroy(bc);
         var it = self.scan_cursor_map.iterator();
         while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);

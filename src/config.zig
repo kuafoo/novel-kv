@@ -50,7 +50,7 @@ pub const Config = struct {
         };
         inline for (fields) |field_name| {
             if (@field(self, field_name)) |v| {
-                // dupeZ allocates len+1 (with sentinel), free the full allocation
+                // dupeSentinel allocates len+1 (with sentinel), free the full allocation
                 allocator.free(v.ptr[0 .. v.len + 1]);
             }
         }
@@ -106,27 +106,27 @@ fn applyValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8, raw_v
 
     // Server
     if (eql(key, "host")) {
-        cfg.host = try allocator.dupeZ(u8, value);
+        cfg.host = try allocator.dupeSentinel(u8, value, 0);
     } else if (eql(key, "port")) {
         cfg.port = try std.fmt.parseInt(u16, value, 10);
     } else if (eql(key, "data")) {
-        cfg.data = try allocator.dupeZ(u8, value);
+        cfg.data = try allocator.dupeSentinel(u8, value, 0);
     } else if (eql(key, "log-level")) {
-        cfg.log_level = try allocator.dupeZ(u8, value);
+        cfg.log_level = try allocator.dupeSentinel(u8, value, 0);
     } else if (eql(key, "requirepass")) {
-        cfg.requirepass = try allocator.dupeZ(u8, value);
+        cfg.requirepass = try allocator.dupeSentinel(u8, value, 0);
     } else if (eql(key, "disable-dangerous")) {
         cfg.disable_dangerous = parseBool(value);
     } else if (eql(key, "disable-commands")) {
-        cfg.disable_commands = try allocator.dupeZ(u8, value);
+        cfg.disable_commands = try allocator.dupeSentinel(u8, value, 0);
     }
     // TLS
     else if (eql(key, "tls-cert")) {
-        cfg.tls_cert = try allocator.dupeZ(u8, value);
+        cfg.tls_cert = try allocator.dupeSentinel(u8, value, 0);
     } else if (eql(key, "tls-key")) {
-        cfg.tls_key = try allocator.dupeZ(u8, value);
+        cfg.tls_key = try allocator.dupeSentinel(u8, value, 0);
     } else if (eql(key, "tls-ca")) {
-        cfg.tls_ca = try allocator.dupeZ(u8, value);
+        cfg.tls_ca = try allocator.dupeSentinel(u8, value, 0);
     } else if (eql(key, "tls-replica")) {
         cfg.tls_replica = parseBool(value);
     }
@@ -139,13 +139,13 @@ fn applyValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8, raw_v
         cfg.replicaof_host = try allocator.dupe(u8, host_part);
         cfg.replicaof_port = std.fmt.parseInt(u16, port_part, 10) catch return error.InvalidValue;
     } else if (eql(key, "masterauth")) {
-        cfg.masterauth = try allocator.dupeZ(u8, value);
+        cfg.masterauth = try allocator.dupeSentinel(u8, value, 0);
     }
     // HTTP
     else if (eql(key, "http-port")) {
         cfg.http_port = try std.fmt.parseInt(u16, value, 10);
     } else if (eql(key, "http-secret")) {
-        cfg.http_secret = try allocator.dupeZ(u8, value);
+        cfg.http_secret = try allocator.dupeSentinel(u8, value, 0);
     } else if (eql(key, "http-sign-ttl")) {
         cfg.http_sign_ttl = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(key, "http-rate-burst")) {

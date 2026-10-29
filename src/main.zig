@@ -458,7 +458,7 @@ fn runGenCerts(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args.
     };
 
     // 设置私钥文件权限为 600
-    const key_path_z = try allocator.dupeZ(u8, key_path);
+    const key_path_z = try allocator.dupeSentinel(u8, key_path, 0);
     defer allocator.free(key_path_z);
     _ = std.os.linux.chmod(key_path_z.ptr, 0o600);
 
@@ -563,7 +563,7 @@ fn runMigrateHashPrefix(io: std.Io, allocator: std.mem.Allocator, args: std.proc
     log.info("Opening database at: {s}", .{data_path});
     log.info("Dry run: {}", .{dry_run});
 
-    const data_path_z = try allocator.dupeZ(u8, data_path);
+    const data_path_z = try allocator.dupeSentinel(u8, data_path, 0);
     defer allocator.free(data_path_z);
 
     var db = storage.Database.open(allocator, .{

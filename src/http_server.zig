@@ -488,7 +488,7 @@ fn writeCorsPreflight(writer: *std.Io.Writer) !void {
 // ============================================================
 
 fn getClientIp(stream: std.Io.net.Stream) [46]u8 {
-    var result: [46]u8 = [_]u8{0} ** 46;
+    var result: [46]u8 = @splat(0);
     var addr: std.posix.sockaddr.storage = undefined;
     var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
     std.posix.getpeername(stream.socket.handle, @ptrCast(@alignCast(&addr)), &addr_len) catch return result;

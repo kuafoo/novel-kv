@@ -474,7 +474,7 @@ pub const DhKeyPair = struct {
         var kp: DhKeyPair = .{};
         for (named_groups) |ng|
             switch (ng) {
-                .x25519 => kp.x25519_kp = try X25519.KeyPair.generateDeterministic(seed[0..][0..X25519.seed_length].*),
+                .x25519 => kp.x25519_kp = X25519.KeyPair.generateDeterministic(seed[0..][0..X25519.seed_length].*),
                 .secp256r1 => kp.secp256r1_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed[32..][0..EcdsaP256Sha256.KeyPair.seed_length].*),
                 .secp384r1 => kp.secp384r1_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic(seed[32 + 32 ..][0..EcdsaP384Sha384.KeyPair.seed_length].*),
                 .x25519_ml_kem768 => kp.ml_kem768 = try MLKem768.KeyPair.generateDeterministic(seed[32 + 32 + 48 + 64 ..][0..MLKem768.seed_length].*),
